@@ -58,7 +58,10 @@ DNOP	macro
 ;;; Constants ;;;
 
 UARTBT	equ	208	;Bit time for pseudo-UART (cycles)
-VERTTHR	equ	14	;A pulse with more downtime than this (us) is vertical
+VERTTHR	equ	8	;A pulse with more downtime than this (us) is vertical
+SPULSES	equ	8	;Maximum number of serrated pulses we expect to see
+POSTVRT	equ	32	;Delay (cycles) from end of vert. to first horiz. pulse
+HPWIDTH	equ	3	;Width (us) of synthesized pulses across vertical pulse
 
 ;Pin Assignments
 TX_PIN	equ	RA4	;UART Tx pin
@@ -76,74 +79,21 @@ VATEANH	equ	6	;Set if the last V pulse eats the first H pulse after
 	cblock	0x70	;Bank-common registers
 	
 	FLAGS	;You've got to have flags
+	VPULSES	;Number of vertical sync pulses in a single frame
+	HTCYCLS	;Horizontal pulse period in cycles
+	HTMICRO	;Horizontal pulse period in microseconds
 	HPULSEH	;Number of horizontal sync pulses on composite sync in a single
 	HPULSEL	; frame
-	HPERIOD	;Horizontal pulse period
-	VPULSES	;Number of vertical sync pulses in a single frame
 	SERPRE	;Count of serrated periods before vertical sync
 	SERPOST	;Count of serrated periods after vertical sync
 	VSYNTH	;Number of pulses that should be synthed across vertical sync
 	T1SKPH	;Value to load into Timer1 to sleep through horizontal pulses
 	T1SKPL	; "
-	X5
-	X4	
-	X3
-	X2	;Various purposes
+	X4	;Various purposes
+	X3	; "
+	X2	; "
 	X1	; "
 	X0	; "
-	
-	endc
-
-	cblock	0x20
-	
-	PROF00	;Signal profile registers
-	PROF01	; "
-	PROF02	; "
-	PROF03	; "
-	PROF04	; "
-	PROF05	; "
-	PROF06	; "
-	PROF07	; "
-	PROF08	; "
-	PROF09	; "
-	PROF0A	; "
-	PROF0B	; "
-	PROF0C	; "
-	PROF0D	; "
-	PROF0E	; "
-	PROF0F	; "
-	PROF10	; "
-	PROF11	; "
-	PROF12	; "
-	PROF13	; "
-	PROF14	; "
-	PROF15	; "
-	PROF16	; "
-	PROF17	; "
-	PROF18	; "
-	PROF19	; "
-	PROF1A	; "
-	PROF1B	; "
-	PROF1C	; "
-	PROF1D	; "
-	PROF1E	; "
-	PROF1F	; "
-	PROF20	; "
-	PROF21	; "
-	PROF22	; "
-	PROF23	; "
-	PROF24	; "
-	PROF25	; "
-	PROF26	; "
-	PROF27	; "
-	PROF28	; "
-	PROF29	; "
-	PROF2A	; "
-	PROF2B	; "
-	PROF2C	; "
-	PROF2D	; "
-	PROF2E	; "
-	PROF2F	; "
 	
 	endc
 
@@ -166,8 +116,10 @@ VATEANH	equ	6	;Set if the last V pulse eats the first H pulse after
 ;;; Interrupt Handler ;;;
 
 Interrupt
-	clrf	INTCON		;Interrupt is just to wake us up, so disable
-	retfie			; all interrupt sources and return
+	clrf	INTCON		;Prevent immediate reentry of interrupt handler
+	movlb	31		;Return to caller's caller
+	decf	STKPTR,F	; "
+	retfie			; "
 
 
 ;;; Hardware Initialization ;;;
@@ -177,13 +129,17 @@ Init
 	movlw	B'00010111'	; two seconds if not cleared (even in sleep)
 	movwf	WDTCON
 
-	banksel	WPUA		;Weak pullup enabled on UART Tx/pushbutton only
-	movlw	1 << TX_PIN
-	movwf	WPUA
+	banksel	IOCAN		;By default, IOC catches negative edges on
+	movlw	1 << CS_PIN	; composite sync
+	movwf	IOCAN
 
 	banksel	OPTION_REG	;Weak pullups enabled
 	movlw	B'01111111'
 	movwf	OPTION_REG
+
+	banksel	WPUA		;Weak pullup enabled on UART Tx/pushbutton only
+	movlw	1 << TX_PIN
+	movwf	WPUA
 
 	banksel	ANSELA		;All pins digital, not analog
 	clrf	ANSELA
@@ -196,6 +152,15 @@ Init
 	movlw	B'00011011'	; pullup to drive it), sync inputs inputs, sync
 	movwf	TRISA		; outputs outputs
 
+	banksel	PIE1		;Make it so INTCON.PEIE means Timer1, we don't
+	movlw	1 << TMR1IF	; need any other peripheral interrupts
+	movwf	PIE1
+
+	movlw	high IOCAF	;Point FSR1 permanently to IOCAF so it can be
+	movwf	FSR1H		; cleared without switching banks
+	movlw	low IOCAF
+	movwf	FSR1L
+
 	clrf	FLAGS		;Initialize key globals
 
 	;fall through
@@ -203,434 +168,644 @@ Init
 
 ;;; Mainline ;;;
 
-Main
+;Handle the reset cause and output an appropriate message.
+ResetCause
 	movlb	1		;All non-specifically handled resets should be
 	movlw	low SErrorR	; considered errors
 	btfss	PCON,NOT_RWDT	;If a WDT reset occurred, let the user know
 	movlw	low SWDTR	; "
 	btfss	PCON,NOT_POR	;If a power-on reset occurred, say hello
 	movlw	low SPOR	; "
-	btfss	PCON,NOT_RI	;If a reset-command reset occurred, say nothing
-	movlw	low SReset	; "
+	btfss	PCON,NOT_RI	;If a reset-command reset occurred, say it was
+	movlw	low SReset	; because of a sync change
 	call	UartTxString	;Transmit whatever the appropriate string is
 	movlb	1		;Reset reset causes
 	movlw	B'00011111'	; "
 	movwf	PCON		; "
-	
-	bra	Synthesis	;TODO determine mode automagically
-
-Passthrough
-	call	SetPassthrough	;Set up CLCs for passthrough mode
-	movlb	7		;Set the IOC interrupt to interrupt on vertical
-	movlw	1 << VS_PIN	; sync negative edges so as long as we keep
-	movwf	IOCAN		; getting those, we keep clearing the WDT and
-	clrf	IOCAP		; keep passing through vertical and horizontal
-	movlw	1 << GIE	; sync until the WDT times out
-	movwf	INTCON		; "
-Passth0	clrf	IOCAF		;Clear the IOC interrupt
-	bsf	INTCON,IOCIE	;Set the IOC interrupt to wake us up and go to
-	sleep			; sleep
-	bra	Passth0		;Awakened by IOC interrupt, WDT cleared, loop
-
-Synthesis
-	call	SetSynthesis	;Set up CLCs for synthesis mode
-	movlw	low SProfil	;Let the user know what we're doing
+	movlb	0		;Wait for 16 ms and see if we detect any edges
+	clrf	TMR1H		; on composite sync; if we don't, pass through
+	clrf	TMR1L		; horizontal and vertical sync
+	movlw	B'00000001'	; "
+	movwf	T1CON		; "
+	clrf	PIR1		; "
+	clrf	INDF1		; "
+	btfss	PIR1,TMR1IF	; "
+	bra	$-1		; "
+	movlw	low SPassTh	; "
+	btfss	INTCON,IOCIF	; "
 	call	UartTxString	; "
-	call	ProfileSignal	;Profile the signal
-	call	ParseProfile	;Parse the profile
-	movf	WREG,W		;If no error, skip ahead
-	btfsc	STATUS,Z	; "
-	bra	Synthe0		; "
-	call	UartTxHex	;If there was an error, print the code and wait
-	bra	$		; for WDT to reset us
-Synthe0	call	ConfigTimers	;Configure timers
-	movlw	low SProfOk	;Let user know profiling succeeded and dump a
-	call	UartTxString	; mini signal trace of the signal to UART
-	call	UartTxHexDump	; followed by a newline
-	movlw	low SCRLF	; "
-	call	UartTxString	; "
-	movlw	low SHeader	;Print profile header
-	call	UartTxString	; "
-	movf	HPULSEH,W	;Print horizontal pulse count
-	call	UartTxHex	; "
-	movf	HPULSEL,W	; "
-	call	UartTxHex	; "
-	call	UartTxSpace	;Print space
-	movf	HPERIOD,W	;Print horizontal period
-	call	UartTxHex	; "
-	call	UartTxSpace	;Print space
-	movf	VPULSES,W	;Print vertical pulse count
-	call	UartTxHex	; "
-	call	UartTxSpace	;Print space
-	movf	SERPRE,W	;Print pre-vertical serrated pulse count
-	call	UartTxHex	; "
-	call	UartTxSpace	;Print space
-	movf	SERPOST,W	;Print post-vertical serrated pulse count
-	call	UartTxHex	; "
-	call	UartTxSpace	;Print space
-	movlw	low SYes	;Print yes if vertical pulse is flat, else no
-	btfss	FLAGS,VISFLAT	; "
-	movlw	low SNo		; "
-	call	UartTxString	; "
-	movlw	low SYes	;Print yes if last vertical pulse eats first
-	btfss	FLAGS,VATEANH	; horizontal pulse, else no
-	movlw	low SNo		; "
-	call	UartTxString	; "
-	movlw	low SCRLF	;Two newlines
-	call	UartTxString	; "
-	movlw	low SCRLF	; "
-	call	UartTxString	; "
+	btfss	INTCON,IOCIF	; "
+	bra	Passthrough	; "
+	call	VerticalTrace	;If we saw composite sync, do a trace of it
+	call	SynthesisPrep	;Do synthesis prep
+	call	SynthesisReport	;Output a report on synthesis prep
+	call	SetupPwm	;Set up PWM
 	call	FindStart	;Find the start of the vertical sync area
-	btfss	FLAGS,VISFLAT	;If there is more than one vertical pulse, skip
-	bra	Synthe7		; ahead
-Synthe1	movf	SERPRE,W	;If there are no pre-vertical serrated pulses,
-	btfsc	STATUS,Z	; skip ahead, else loop waiting for a falling
-	bra	Synthe7		; edge and eating a pulse
-	movwf	X1		; "
-Synthe2	call	WaitForLow	; "
-	call	EatPulse	; "
-	decfsz	X1,F		; "
-	bra	Synthe2		; "
-	movf	SERPOST,W	;Check the number of post-vertical serrated
-	btfsc	STATUS,Z	; pulses; if there are none, skip ahead
-	bra	Synthe5		; "
-	movwf	X1		;Store it for use as a loop variable
-	btfsc	FLAGS,VATEANH	;If the vertical pulse eats first horizontal
-	bra	Synthe3		; pulse, skip ahead
-	call	SplitSingleFlat	;If there are post-vertical serrated pulses and
-	call	WaitForLow	; the vertical pulse does not eat the first
-	call	EatPulse	; horizontal pulse, loop waiting for a falling
-	decfsz	X1,F		; edge and eating a pulse, then sleep and loop
-	bra	Synthe4		; "
-	bra	Synthe6		; "
-Synthe3	call	SplitSingleFlat	;If there are post-vertical serrated pulses and
-	call	EatPulse	; the vertical pulse eats the first horizontal
-	decfsz	X1,F		; pulse, do this split loop thing for speed
-	bra	Synthe4		; (there's very little time coming out of
-	bra	Synthe6		; SplitSingleFlat); it does the same as above
-Synthe4	call	WaitForLow	; except the first call to WaitForLow is
-	call	EatPulse	; skipped
-	decfsz	X1,F		; "
-	bra	Synthe4		; "
-	bra	Synthe6		; "
-Synthe5	call	SplitSingleFlat	;If there are no post-vertical serrated pulses,
-Synthe6	call	SleepEdgePrep	; just split the single vertical pulse, sleep,
-	call	SleepEdge	; and loop
-	bra	Synthe1		; "
-Synthe7	decf	VPULSES,W	;If vertical pulses are not flat, for each one
-	btfsc	STATUS,Z	; except the last, wait for a falling edge on
-	bra	Synthe9		; composite sync, set vertical sync low (if it
-	movwf	X1		; isn't already), then force horizontal sync
-Synthe8	call	WaitForLow	; high until composite sync goes high
-	call	SetVSyncLow	; "
-	call	ForceHSyncHigh	; "
-	decfsz	X1,F		; "
-	bra	Synthe8		; "
-Synthe9	call	WaitForLow	;Wait for the final falling edge
-	movlb	30		;Connect CLC2's latch enable to CLC1's output
-	movlw	B'00100000'	; (vertical sync, currently low)
-	movwf	CLC2GLS0	; "
-	movlw	B'00000011'	;Momentarily actuate the S line, setting
-	movwf	CLC2GLS3	; horizontal sync high
-	clrf	CLC2GLS3	; "
-	call	SleepEdgePrep2	;Get ready for sleep
-	movlb	0		;If composite sync is high at this point, there
-	btfsc	PORTA,CS_PIN	; has been a change in sync and we should reset
-	reset			; to deal with it
-	call	WaitForHigh	;Wait for composite sync to go high
-	movlb	30		;Momentarily actuate the S input of the DFF
-	movlw	B'00000011'	; that feeds vertical sync, which also sets the
-	movwf	CLC1GLS3	; enable on the latch that feeds horizontal
-	clrf	CLC1GLS3	; sync
-	call	SleepEdge	;Sleep until the next vertical sync area
-	bra	Synthe7		;Loop
+	btfsc	FLAGS,VISFLAT	;Do either PWM or passthrough synthesis,
+	call	PwmSynthesis	; depending on whether vertical sync is flat or
+	btfss	FLAGS,VISFLAT	; not
+	call	PassSynthesis	; "
+	bra	$		;We shouldn't get here
 
-
-;;; Subprograms ;;;
-
-;Configure the CLCs so vertical and horizontal sync are passed through.
-;Clobbers: BSR (30)
-SetPassthrough
+;Pass through horizontal and vertical sync until reset.
+Passthrough
 	movlb	30		;Set CLC1 to feed vertical sync through from
-	clrf	CLC1SEL0	; CLC1IN0/RA3 to CLC1/RA2 unaltered
-	clrf	CLC1SEL1	; "
+	clrf	CLC1SEL0	; CLC1IN0/RA3 to CLC1/RA2 unaltered and set
+	clrf	CLC1SEL1	; CLC2 to feed horizontal sync through from
+	movlw	B'00000001'	; CLC2IN1/RA0 to CLC2/RA5 unaltered, and set
+	movwf	CLC2SEL0	; the CLCs to interrupt on either edge
+	clrf	CLC2SEL1	; "
 	movlw	B'00000010'	; "
 	movwf	CLC1GLS0	; "
 	movwf	CLC1GLS1	; "
 	movwf	CLC1GLS2	; "
 	movwf	CLC1GLS3	; "
-	clrf	CLC1POL		; "
-	movlw	B'11000000'	; "
-	movwf	CLC1CON		; "
-	movlw	B'00000001'	;Set CLC2 to feed horizontal sync through from
-	movwf	CLC2SEL0	; CLC2IN1/RA0 to CLC2/CLC1IN1/RA5 unaltered
-	clrf	CLC2SEL1	; "
-	movlw	B'00000010'	; "
 	movwf	CLC2GLS0	; "
 	movwf	CLC2GLS1	; "
 	movwf	CLC2GLS2	; "
 	movwf	CLC2GLS3	; "
+	clrf	CLC1POL		; "
 	clrf	CLC2POL		; "
-	movlw	B'11000000'	; "
+	movlw	B'11011000'	; "
+	movwf	CLC1CON		; "
 	movwf	CLC2CON		; "
-	return			;Done
+	movlb	1		;Enable CLC1 interrupt
+	movlw	1 << CLC1IE	; "
+	movwf	PIE3		; "
+	movlw	1 << PEIE	; "
+	movwf	INTCON		; "
+	movlb	0		; "
+Passth0	clrf	PIR3		;Clear the interrupt
+	sleep			;Back to sleep
+	bra	Passth0		;Awakened by interrupt, WDT cleared, loop
 
-;Configure the CLCs so both vertical and horizontal sync are set up to be
-; synthesized from composite sync, with composite sync being fed to horizontal
-; sync at first
-;Clobbers: BSR (30)
-SetSynthesis
+;Make up and output a tiny little trace of the vertical sync area.
+VerticalTrace
+	movlw	low STrace	;Output trace header
+	call	UartTxString	; "
+	movlw	0x20		;Fill the 48-byte SRAM buffer with 0xFF and put
+	movwf	FSR0H		; FSR0 at the beginning of it
+	movlw	0x30		; "
+	movwf	FSR0L		; "
+	movlw	0xFF		; "
+VerTra0	movwi	--FSR0		; "
+	movf	FSR0L,F		; "
+	btfss	STATUS,Z	; "
+	bra	VerTra0		; "
+	clrf	X1		;Clear count of pulses
+	clrf	X0		; "
+VerTra1	call	MeasurePulse	;Measure pulses until we find a horizontal one
+	btfsc	STATUS,Z	; (in case we happen to be in vertical sync
+	bra	VerTra1		; right now)
+VerTra2	call	MeasurePulse	;Measure pulses until we find a vertical one
+	btfss	STATUS,Z	; "
+	bra	VerTra2		; "
+VerTra3	incf	X0,F		;Count vertical pulses until we find a
+	btfsc	STATUS,Z	; horizontal one
+	incf	X1,F		; "
+	call	MeasurePulse	; "
+	btfsc	STATUS,Z	; "
+	bra	VerTra3		; "
+VerTra4	incf	X0,F		;Count horizontal pulses until we find a
+	btfsc	STATUS,Z	; vertical one, indicating we've counted all
+	incf	X1,F		; pulses
+	call	MeasurePulse	; "
+	btfss	STATUS,Z	; "
+	bra	VerTra4		; "
+	movlw	12		;Subtract half the size of the buffer (12 since
+	subwf	X0,F		; each item in the buffer is a pair of bytes)
+	movlw	0		; "
+	subwfb	X1,F		; "
+	incf	X1,F		;Increment X1 so decfsz works right
+VerTra5	call	MeasurePulse	;Count off pulses until we get to a point where
+	decfsz	X0,F		; 24 samples (of both up and down time) will
+	bra	VerTra5		; about cover all the interesting stuff in the
+	decfsz	X1,F		; vertical sync area
+	bra	VerTra5		; "
+	movlw	0		;Buffer values start from zero
+	btfsc	PORTA,CS_PIN	;Wait for composite sync to go low
+	bra	$-1		; "
+	bra	VerTra7		;Jump into middle of loop
+VerTra6	addlw	1		;Increment W for every 1 us that composite sync
+	btfsc	PORTA,CS_PIN	; stays high
+	bra	VerTra6		; "
+	movwi	FSR0++		;Write the value of W to the buffer
+	incfsz	INDF0,F		;If the value at this point in the buffer is 0,
+	bra	VerTra8		; we've gone past the end, so break out
+VerTra7	addlw	1		;Increment W for every 1 us that composite sync
+	btfss	PORTA,CS_PIN	; stays low
+	bra	VerTra7		; "
+	movwi	FSR0++		;Write the value of W to the buffer
+	bra	VerTra6		;Loop
+VerTra8	clrf	FSR0L		;Adjust recorded measurements so they're based
+	movlw	0		; on zero rather than the previous measurement
+VerTra9	subwf	INDF0,F		; "
+	addwf	INDF0,W		; "
+	incf	FSR0L,F		; "
+	btfss	FSR0L,6		; "
+	bra	VerTra9		; "
+	clrf	FSR0L		;Rewind FSR0
+VerTr10	moviw	FSR0++		;Transmit next byte
+	call	UartTxHex	; "
+	call	UartTxSpace	;Transmit a space
+	movf	FSR0L,W		;If we're at a 16-byte boundary, transmit a
+	andlw	B'00001111'	; newline
+	btfss	STATUS,Z	; "
+	bra	VerTr11		; "
+	movlw	0x0D		; "
+	call	UartTx		; "
+	movlw	0x0A		; "
+	call	UartTx		; "
+VerTr11	movf	FSR0L,W		;If we've written out the whole buffer, done,
+	xorlw	0x30		; else loop
+	btfss	STATUS,Z	; "
+	bra	VerTr10		; "
+	return			; "
+
+;Common code for all synthesis strategies.
+;Error codes returned in W:
+; 0 - Success
+; 1 - Too few horizontal pulses
+; 2 - Uneven serrated pulses
+; 3 - Non-serrated pulses between serrated pulses and vertical sync
+; 4 - Unexpected horizontal pulse
+; 5 - Single vertical pulse that doesn't eat first horizontal pulse
+SynthesisPrep
 	movlb	30		;Set CLC2 to be a transparent latch with S and
 	movlw	B'00110000'	; R, initially feeding through composite sync,
-	movwf	CLC2SEL0	; with Timer2 and CLC1 available as input
-	clrf	CLC2SEL1	; sources
-	movlw	B'00000011'	; "
-	movwf	CLC2GLS0	; "
-	movlw	B'00000010'	; "
+	movwf	CLC2SEL0	; input sources as follows:
+	movlw	B'00100000'	; 1 - CLCIN0/RA1 (Composite Sync In)
+	movwf	CLC2SEL1	; 2 - T2_match
+	clrf	CLC2GLS0	; 3 - LC1_out (Vertical Sync Out)
+	movlw	B'00000010'	; 4 - PWM1_out
 	movwf	CLC2GLS1	; "
 	clrf	CLC2GLS2	; "
 	clrf	CLC2GLS3	; "
-	clrf	CLC2POL		; "
+	movlw	B'00000001'	; "
+	movwf	CLC2POL		; "
 	movlw	B'11000111'	; "
 	movwf	CLC2CON		; "
-	movlw	B'00000001'	;Set CLC1 to be a DFF with S and R, initially
-	movwf	CLC1SEL0	; set, and ready on demand to (1) be set low or
-	clrf	CLC1SEL1	; (2) be set high on a rising edge from
-	movlw	B'00000011'	; horizontal (reflecting composite) sync
-	movwf	CLC1GLS0	; "
-	movwf	CLC1GLS1	; "
+	movlw	B'01010000'	;Set CLC1 to be a DFF with S and R, initially
+	movwf	CLC1SEL0	; set, input sources as follows:
+	clrf	CLC1SEL1	; 2 - LC2_out (Horizontal Sync Out)
+	clrf	CLC1GLS0	; "
+	clrf	CLC1GLS1	; "
 	clrf	CLC1GLS2	; "
-	movwf	CLC1GLS3	; "
-	clrf	CLC1POL		; "
+	clrf	CLC1GLS3	; "
+	movlw	B'00001010'	; "
+	movwf	CLC1POL		; "
 	movlw	B'11000100'	; "
 	movwf	CLC1CON		; "
-	clrf	CLC1GLS3	; "
-	return			;Done
-
-;Set up Timer2's period register to time synthetic pulses and T1SKPH:L up with
-; the number of positive edges that must be skipped in between sync generation.
-;Clobbers: BSR (0)
-ConfigTimers
-	movlb	0		;Set Timer2's period so it can be used to time
-	decf	HPERIOD,W	; synthetic vertical pulses and start it
-	movwf	PR2		; "
+	bcf	CLC1POL,3	; "
+Synthe0	call	MeasurePulse	;Measure pulses until we find a horizontal one
+	btfsc	STATUS,Z	; (in case we happen to be in vertical sync
+	bra	Synthe0		; right now)
+Synthe1	call	MeasurePulse	;Measure pulses until we find a vertical one
+	btfss	STATUS,Z	; "
+	bra	Synthe1		; "
+	clrf	VPULSES		;Clear count of vertical pulses
+Synthe2	incf	VPULSES,F	;Count vertical pulses including the one we
+	call	MeasurePulse	; just found
+	btfsc	STATUS,Z	; "
+	bra	Synthe2		; "
+	movlw	(SPULSES*2)-1	;Use horizontal pulse count register to count
+	movwf	HPULSEL		; down potential serrated pulses
+Synthe3	call	MeasurePulse	;Count a horizontal pulse and error if for some
+	btfsc	STATUS,Z	; reason it's a vertical pulse
+	retlw	1		; "
+	decfsz	HPULSEL,F	; "
+	bra	Synthe3		; "
+	movlb	0		;Start Timer2 counting cycles
 	movlw	B'00000100'	; "
 	movwf	T2CON		; "
-	comf	HPULSEH,W	;One's complement horizontal pulse count to
-	movwf	T1SKPH		; start with (we still need to add one to it)
-	comf	HPULSEL,W	; "
+	call	TimeNextPulse	;Wait for the next composite sync pulse and
+	movwf	HTCYCLS		; store the Timer2 time when it occurred
+	call	TimeNextPulse	;Wait for the next composite pulse and store
+	subwf	HTCYCLS,W	; the difference in Timer2 time between it and
+	sublw	0		; the previous, this is our horizontal pulse
+	movwf	HTCYCLS		; period in cycles
+	bsf	T2CON,T2CKPS0	;Start Timer2 counting microseconds
+	call	TimeNextPulse	;Wait for the next composite sync pulse and
+	movwf	HTMICRO		; store the Timer2 time when it occurred
+	call	TimeNextPulse	;Wait for the next composite pulse and store
+	subwf	HTMICRO,W	; the difference in Timer2 time between it and
+	sublw	0		; the previous, this is our horizontal pulse
+	movwf	HTMICRO		; period in microseconds
+	clrf	HPULSEH		;Start HPULSEH:L at the number of horizontal
+	movlw	(SPULSES*2)+3	; pulses we've seen so far minus one
+	movwf	HPULSEL		; "
+Synthe4	incf	HPULSEL,F	;Count horizontal pulses including the one we
+	btfsc	STATUS,Z	; just found until a vertical one is reached
+	incf	HPULSEH,F	; "
+	call	MeasurePulse	; "
+	btfss	STATUS,Z	; "
+	bra	Synthe4		; "
+	decfsz	VPULSES,W	;If there's only one vertical pulse, proceed,
+	bra	Synth13		; else skip ahead to get us to the last one
+Synthe5	clrf	INDF1		;Clear any previous edges
+	clrf	T1CON		;Stop Timer1 if it's running
+	comf	HPULSEH,W	;Set Timer1 to overflow after HPULSEH:L minus
+	movwf	TMR1H		; (SPULSES * 2) + 1 rising edges once activated
+	comf	HPULSEL,W	; (the extra plus-one is because we're two's
+	addlw	(SPULSES*2)+2	; complementing HPULSEH:L)
+	movwf	TMR1L		; "
+	btfsc	STATUS,C	; "
+	incf	TMR1H,F		; "
+	bsf	FLAGS,VATEANH	;Set VATEANH flag, we'll clear it if necessary
+	btfss	PORTA,CS_PIN	;Wait until the vertical pulse goes high
+	bra	$-1		; "
+	movlw	POSTVRT/3	;Delay for POSTVRT cycles while we wait to see
+	decfsz	WREG,W		; if there is a falling edge on composite sync
+	bra	$-1		; "
+	btfss	INDF1,CS_PIN	;If there was a falling edge during the delay,
+	bra	Synthe6		; that was the first horizontal pulse, so
+	bcf	FLAGS,VATEANH	; shorten the interval by one pulse, also clear
+	incf	TMR1L,F		; the VATEANH flag; if there was no falling
+	btfsc	STATUS,Z	; edge, the last vertical pulse ate the first
+	incf	TMR1H,F		; horizontal pulse, so leave the flag set
+	btfss	PORTA,CS_PIN	;Make sure (if horizontal pulse wasn't eaten)
+	bra	$-1		; that composite sync is high
+Synthe6	call	SleepUntilTimer1;Sleep until Timer1 counts enough pulses
+	lsrf	HTMICRO,W	;Calculate 3/4 of the period between pulses (in
+	movwf	X0		; microseconds) to use as a threshold to tell
+	lsrf	WREG,W		; whether a pulse is serrated or not
+	addwf	X0,F		; "
+	clrf	SERPRE		;Zero count of pre-vertical serrated pulses
+	movlw	(SPULSES*2)+1	;Start countdown of total pre-vertical pules
+	movwf	SERPOST		; "
+Synthe7	call	TimeNextPulse	;Get the Timer2 (microsecond) value of the
+	movwf	T1SKPH		; first pulse as a time base
+	decfsz	SERPOST,F	;Count down the pulse we just saw and, if the
+	bra	Synthe8		; next is the first vertical pulse, something
+	retlw	2		; is wrong
+Synthe8	call	TimeNextPulse	;Get the Timer2 value of the next pulse
+	movwf	T1SKPL		;Save it for later use as the new time base
+	subwf	T1SKPH,W	;Get the difference betwen this value and the
+	sublw	0		; previous time base
+	subwf	X0,W		;Compare it to the serration threshold
+	movf	T1SKPL,W	;Set the time base to the new time base
+	movwf	T1SKPH		; "
+	btfsc	STATUS,C	;If the difference is below the threshold, skip
+	bra	Synth15		; ahead
+	movf	SERPRE,W	;If the difference is above the threshold, make
+	btfss	STATUS,Z	; sure we haven't already counted pre-vertical
+	retlw	3		; pulses, and if we have, something is wrong
+	decfsz	SERPOST,F	;If the difference is above the threshold,
+	bra	Synthe8		; count down the remaining pulses and loop
+Synthe9	decf	VPULSES,W	;If there is only one vertical pulse, skip
+	btfsc	STATUS,Z	; ahead to time it and find out how many pulses
+	bra	Synth16		; we need to synthesize
+	clrf	VSYNTH		;Don't need to synthesize any vertical pulses
+	movf	VPULSES,W	;Skip past the falling edges of the vertical
+	movwf	SERPOST		; pulses, the next falling edge is of the first
+Synth10	call	TimeNextPulse	; horizontal pulse
+	decfsz	SERPOST,F	; "
+	bra	Synth10		; "
+Synth11	call	TimeNextPulse	;Get the Timer2 (microsecond) value of the
+	movwf	T1SKPH		; first pulse as a time base
+Synth12	call	TimeNextPulse	;Get the Timer2 value of the next pulse
+	movwf	T1SKPL		;Save it for later use as the new time base
+	subwf	T1SKPH,W	;Get the difference betwen this value and the
+	sublw	0		; previous time base
+	subwf	X0,W		;Compare it to the serration threshold
+	movf	T1SKPL,W	;Set the time base to the new time base
+	movwf	T1SKPH		; "
+	btfsc	STATUS,C	;If the difference is below the threshold, skip
+	bra	Synth19		; ahead
+	movlb	7		;Switch IOC to catch falling edges again in
+	movlw	1 << CS_PIN	; case it was switched
+	clrf	IOCAP		; "
+	movwf	IOCAN		; "
+	movlb	0		; "
+	comf	HPULSEH,W	;One's complement HPULSEH:L into T1SKPH:L,
+	movwf	T1SKPH		; effectively giving us the count-up value for
+	comf	HPULSEL,W	; Timer1 plus one extra edge - it'd take us
+	movwf	T1SKPL		; into the first vertical pulse as it stands
+	lslf	SERPRE,W	;Shorten the count-up value by (2 * SERPRE) +
+	addwf	SERPOST,W	; (2 * SERPOST); with that extra edge, this is
+	addwf	SERPOST,W	; the correct value if the last vertical pulse
+	btfss	FLAGS,VATEANH	; eats the first horizontal pulse; if that is
+	addlw	1		; not the case, shorten it by one more
+	addwf	T1SKPL,F	; "
+	btfsc	STATUS,C	; "
+	incf	T1SKPH,F	; "
+	movlw	2		;Take the timer value we just calculated and
+	addwf	T1SKPL,W	; shave two more edges off of it (since we ate
+	movwf	TMR1L		; two more edges to find out where the end of
+	movlw	0		; the serrated pulses was) and sleep to get us
+	addwfc	T1SKPH,W	; to the beginning of the vertical sync area
+	movwf	TMR1H		; "
+	call	SleepUntilTimer1; "
+	retlw	0		;Success, return
+Synth13	movwf	VSYNTH		;There's more than one vertical pulse, so count
+Synth14	call	MeasurePulse	;Measure a pulse; if it isn't vertical, reset
+	btfss	STATUS,Z	; because something is wrong
+	retlw	4		; "
+	decfsz	VSYNTH,F	;Loop until we're at the last vertical pulse,
+	bra	Synth14		; then rejoin above
+	bra	Synthe5		; "
+Synth15	incf	SERPRE,F	;Count the pre-vertical serration we just saw
+	decfsz	SERPOST,F	;If there are more pre-vertical pulses to look
+	bra	Synthe7		; at, loop
+	bra	Synthe9		;If not, proceed to deal with vertical pulse(s)
+Synth16	btfss	FLAGS,VATEANH	;If the single vertical pulse doesn't eat the
+	retlw	5		; first horizontal pulse, we can't handle this
+	bsf	FLAGS,VISFLAT	;By definition, vertical pulse is flat
+	movlw	B'00000110'	;Set Timer2 to measure in four-microsecond
+	movwf	T2CON		; intervals
+	clrf	VSYNTH		;Zero the count of synthetic vertical pulses
+	lsrf	HTMICRO,W	;Divide horizontal period by four to get our
+	lsrf	WREG,W		; divisor
 	movwf	T1SKPL		; "
-	lslf	SERPRE,W	;Add the pre and post vertical serrated pulse
-	addwf	SERPOST,W	; counts times two (plus one, but only if the
-	addwf	SERPOST,W	; vertical pulse doesn't eat a horizontal one,
-	btfss	FLAGS,VATEANH	; this way we actually subtract one or don't)
-	addlw	1		; to the complemented horizontal pulse count;
-	addwf	T1SKPL,F	; this gives us a count which, once it rolls 
-	movlw	0		; over, equals the number of rising edges we'll
-	addwfc	T1SKPH,F	; need to skip
+	call	TimeNextPulse	;Get the starting point of the vertical pulse
+	movwf	T1SKPH		; "
+	movlb	7		;Switch IOC to catch rising edges instead of
+	movlw	1 << CS_PIN	; falling edges
+	clrf	IOCAN		; "
+	movwf	IOCAP		; "
+	call	TimeNextPulse	;Get the ending point of the vertical pulse and
+	subwf	T1SKPH,F	; calculate the elapsed time (complemented)
+	movf	T1SKPL,W	;Retrieve precalculated divisor
+Synth17	addwf	T1SKPH,F	;Add divisor to complemented dividend
+	btfsc	STATUS,C	;If overflow, we're done, skip back to count
+	bra	Synth18		; post-vertical serrations
+	incf	VSYNTH,F	;If no overflow, increment quotient and loop
+	bra	Synth17		; "
+Synth18	clrf	T1CON		;Stop Timer1 if it's running
+	comf	HPULSEH,W	;Set Timer1 to overflow after HPULSEH:L rising
+	movwf	TMR1H		; edges once activated (the extra plus-one is
+	comf	HPULSEL,W	; because we're two's complementing HPULSEH:L);
+	addlw	1		; this leaves us in the space before the
+	movwf	TMR1L		; vertical pulse and the next rising edge is
+	btfsc	STATUS,C	; that of the vertical pulse (effectively the
+	incf	TMR1H,F		; rising edge of the first horizontal pulse)
+	call	SleepUntilTimer1;Sleep until Timer1 overflows
+	movlw	B'00000101'	;Set Timer2 to count microseconds again
+	movwf	T2CON		; "
+	bra	Synth11		;Rejoin above
+Synth19	incf	SERPOST,F	;Count the post-vertical serration we just saw
+	bra	Synth11		;Loop
+
+;Output a report of the synthesis prep.
+SynthesisReport
+	movlw	low SRpt0	;Output vertical pulse count
+	call	UartTxString	; "
+	movf	VPULSES,W	; "
+	call	UartTxDecShort	; "
+	movlw	low SRpt1	;Output horizontal pulse count
+	call	UartTxString	; "
+	movf	HPULSEH,W	; "
+	movwf	X1		; "
+	movf	HPULSEL,W	; "
+	movwf	X0		; "
+	call	UartTxDecimal	; "
+	movlw	low SRpt2	;Output horizontal period (in cycles and
+	call	UartTxString	; microseconds if under 64 microseconds, just
+	btfss	HTMICRO,7	; microseconds if not)
+	btfsc	HTMICRO,6	; "
+	bra	SynRpt0		; "
+	movf	HTCYCLS,W	; "
+	call	UartTxDecShort	; "
+	movlw	low SRpt3	; "
+	call	UartTxString	; "
+SynRpt0	movf	HTMICRO,W	; "
+	call	UartTxDecShort	; "
+	movlw	low SRpt4	;Output pre and post vertical serrated pulses
+	call	UartTxString	; if any
+	movf	SERPRE,W	; "
+	addwf	SERPOST,W	; "
+	btfsc	STATUS,Z	; "
+	bra	SynRpt1		; "
+	movlw	low SRpt5	; "
+	call	UartTxString	; "
+	movf	SERPRE,W	; "
+	call	UartTxDecShort	; "
+	movlw	low SRpt6	; "
+	call	UartTxString	; "
+	movf	SERPOST,W	; "
+	call	UartTxDecShort	; "
+SynRpt1	btfss	FLAGS,VISFLAT	;If vertical pulse is flat, output count of
+	bra	SynRpt2		; synthesized pulses
+	movlw	low SRpt7	; "
+	call	UartTxString	; "
+	movf	VSYNTH,W	; "
+	call	UartTxDecShort	; "
+SynRpt2	movlw	low SCRLF	; "
+	call	UartTxString	; "
 	return			;Done
 
-;Find the starting point where the sync generation program needs to step in.
-;Clobbers: BSR (0)
+;Set up PWM1 (and thus Timer2) to mimic the horizontal sync pulse frequency.
+SetupPwm
+	movlb	0		;Start Timer2 ticking off cycles at first
+	movlw	B'00000100'	; "
+	movwf	T2CON		; "
+	btfss	HTMICRO,7	;If the horizontal period in cycles is over
+	btfsc	HTMICRO,6	; 255 (64 us or greater, as with the IIgs), set
+	bsf	T2CON,T2CKPS0	; Timer2 to use a 1:4 prescaler
+	decf	HTCYCLS,W	;Set the period of Timer2 according to whether
+	btfsc	T2CON,T2CKPS0	; the 1:4 prescaler is being used or not
+	decf	HTMICRO,W	; "
+	movwf	PR2		; "
+	movlw	HPWIDTH*4	;Set the pulse width according to the HPWIDTH
+	btfsc	T2CON,T2CKPS0	; constant and whether the 1:4 prescaler is
+	movlw	HPWIDTH		; being used or not
+	movlb	12		; "
+	movwf	PWM1DCH		; "
+	clrf	PWM1DCL		; "
+	movlw	B'10010000'	;Turn PWM on, set output to be active-low
+	movwf	PWM1CON		; "
+	movlb	0		;Make sure PWM registers get loaded by forcing
+	decf	PR2,W		; Timer2 to roll over
+	movwf	TMR2		; "
+	return			;Done
+
+;Find the start of the vertical sync area.
 FindStart
-	movlb	7		;Get IOC set up to catch falling edges
-	movlw	1 << CS_PIN	; "
-	movwf	IOCAN		; "
-	clrf	IOCAP		; "
-	movlw	1 << GIE	;Make sure interrupt subsystem is on (but not
-	movwf	INTCON		; yet the IOC interrupt source)
-FindSt0	movlb	7		;Sleep until we see a negative edge on the
-	clrf	IOCAF		; composite sync pin
-	bsf	INTCON,IOCIE	; "
-	sleep			; "
-	movlb	0		;If we come out of sleep to find that composite
-	btfsc	PORTA,CS_PIN	; sync pin is high again, it's not a vertical
-	bra	FindSt0		; pulse, so loop and retry
-	clrf	T1CON		;Stop Timer1
-	lslf	SERPOST,W	;Lengthen the Timer1 skip value by two times
-	addwf	VPULSES,W	; the post-vertical serrated pulses plus the
-	btfsc	FLAGS,VATEANH	; number of vertical pulses, minus one if the
-	addlw	-1		; last vertical pulse eats a horizontal pulse
+	movlb	0		;Set up Timer1 to skip past all the edges that
+	clrf	T1CON		; we'll see between just-past-the-beginning-of-
+	lslf	SERPOST,W	; first-vertical-pulse and the beginning of the
+	addwf	VPULSES,W	; vertical sync area
+	btfsc	FLAGS,VATEANH	; "
+	addlw	-1		; "
 	subwf	T1SKPL,W	; "
 	movwf	TMR1L		; "
 	movlw	0		; "
 	subwfb	T1SKPH,W	; "
 	movwf	TMR1H		; "
-	clrf	PIR1		;Set up interrupts to wake us when Timer1 has
-	movlb	1		; seen that many positive edges
-	movlw	1 << TMR1IE	; "
-	movwf	PIE1		; "
+FindSt0	call	MeasurePulse	;Measure pulses until we find a horizontal one
+	btfsc	STATUS,Z	; (in case we happen to be in vertical sync
+	bra	FindSt0		; right now)
+FindSt1	call	MeasurePulse	;Measure pulses until we find a vertical one
+	btfss	STATUS,Z	; "
+	bra	FindSt1		; "
+	goto	SleepUntilTimer1;Arm Timer1 and sleep until it interrupts
+
+;PWM synthesis for when VISFLAT is set.
+PwmSynthesis
+	movf	SERPRE,W	;Initialize a counter of pre-vertical serrated
+	btfsc	STATUS,Z	; pulses or skip ahead if there aren't any
+	bra	PwmSyn1		; "
+	movwf	X0		; "
+PwmSyn0	clrf	INDF1		;Wait for a falling edge on composite sync
+	btfss	INTCON,IOCIF	; "
+	bra	$-1		; "
+	call	ThreeFourths	;Timer2 to match after 3/4 normal pulse width
+	movlb	30		;Latch high state of composite sync to
+	bcf	CLC2POL,0	; horizontal sync
+	clrf	INDF1		;Clear falling edge and Timer2 flags
 	movlb	0		; "
-	movlw	B'11000000'	; "
-	movwf	INTCON		; "
-	movlw	B'10000101'	; "
-	movwf	T1CON		; "
-	sleep			;Sleep until that happens
-	return			;Done
-
-;Configure CLC1 so the DFF that feeds vertical sync is set low.
-;Clobbers: BSR (30)
-SetVSyncLow
-	movlb	30		;Momentarily actuate the R input of the DFF
-	movlw	B'00000011'	; "
-	movwf	CLC1GLS2	; "
-	clrf	CLC1GLS2	; "
-	return			;Done
-
-;Configure CLC1 so the DFF that feeds vertical sync goes high on the next
-; rising edge of horizontal sync (which is being fed from composite sync),
-; wait until that happens, and return.
-;Clobbers: BSR (30)
-SetVSyncHighEdge
-	movlb	30		;Set the clock input of the DFF to composite
-	bcf	CLC1GLS0,0	; sync
-	btfss	CLC1CON,LC1OUT	;Wait until a rising edge from composite sync
-	bra	$-1		; sets the DFF
-	bsf	CLC1GLS0,0	;Hold the DFF clock high
-	return			;Done
-
-;Pass composite sync through to horizontal sync and prepare Timer1 to wake us
-; up after the correct number of horizontal pulses.
-;Clobbers: BSR (0)
-SleepEdgePrep
-	movlb	30		;Set the transparent latch to feed composite
-	movlw	B'00000011'	; sync through to horizontal sync
-	movwf	CLC2GLS0	; "
-SleepEdgePrep2
-	movlw	1 << GIE	;Ready Timer1 to start counting edges as soon
-	movwf	INTCON		; as it's started and its interrupt to wake us
-	movlb	1		; up
-	movlw	1 << TMR1IE	; "
-	movwf	PIE1		; "
-	movlb	0		; "
-	movlw	B'10000100'	; "
-	movwf	T1CON		; "
 	clrf	PIR1		; "
-	bsf	INTCON,PEIE	; "
-	movf	T1SKPH,W	;Load Timer1 with a number of rising edges
-	movwf	TMR1H		; (negated) that will take us through the
-	movf	T1SKPL,W	; horizontal pulses
+	btfss	INTCON,IOCIF	;Wait for the serration that we want to eat
+	bra	$-1		; "
+	btfsc	PIR1,TMR2IF	;If Timer2 matched while we were waiting, the
+	reset			; signal has changed, so reset
+	movlb	30		;Pass composite sync through to horizontal sync
+	bsf	CLC2POL,0	; again
+	decfsz	X0,F		;Count down serrated pulses and loop if there
+	bra	PwmSyn0		; are more
+PwmSyn1	movlb	30		;Gate PWM1 into horizontal sync output (make it
+	bsf	CLC2GLS1,7	; low if both PWM1 and composite sync are low)
+	bcf	CLC1GLS0,2	;Disconnect horizontal sync from the vert clock
+	bsf	CLC1GLS2,2	;Make vertical sync go low when horizontal does
+	call	HoldTimer2	;Hold Timer2 until falling edge on composite
+	clrf	INDF1		;Clear the falling edge
+	movlb	30		;Disconnect the reset input of vertical sync
+	bcf	CLC1GLS2,2	; from the complement of horizontal sync
+	movlb	0		; "
+	movf	VSYNTH,W	;Initialize a counter of pulses to synthesize
+	movwf	X0		; inside the flat vertical pulse
+PwmSyn2	decf	X0,W		;If this about to be the end of the vertical
+	btfss	STATUS,Z	; pulse, set vertical sync to go high on a
+	bra	PwmSyn3		; falling edge of horizontal
+	movlb	30		; "
+	btfss	CLC2CON,LC2OUT	; "
+	bra	$-1		; "
+	bsf	CLC1GLS0,2	; "
+	movlb	0		; "
+PwmSyn3	clrf	PIR1		;Wait for Timer2 to match that many times
+	btfss	PIR1,TMR2IF	; "
+	bra	$-1		; "
+	decfsz	X0,F		; "
+	bra	PwmSyn2		; "
+	call	ThreeFourths	;Timer2 to match after 3/4 normal pulse width
+	btfsc	INTCON,IOCIF	;If there was a falling edge on composite sync
+	reset			; during vertical pulse, signal has changed
+	movlb	30		;Take PWM1 out of gate for horizontal sync
+	bcf	CLC2GLS1,7	; "
+	movf	SERPOST,W	;Initialize a counter of post-vertical serrated
+	btfsc	STATUS,Z	; pulses or skip ahead if there aren't any
+	bra	PwmSyn6		; "
+	movwf	X0		; "
+	bra	PwmSyn5		;Jump into loop since first H pulse was eaten
+PwmSyn4	clrf	INDF1		;Wait for a falling edge on composite sync
+	btfss	INTCON,IOCIF	; "
+	bra	$-1		; "
+	call	ThreeFourths	;Timer2 to match after 3/4 normal pulse width
+	movlb	30		;Latch high state of composite sync to
+PwmSyn5	bcf	CLC2POL,0	; horizontal sync
+	clrf	INDF1		;Clear falling edge and Timer2 flags
+	movlb	0		; "
+	clrf	PIR1		; "
+	btfss	INTCON,IOCIF	;Wait for the serration that we want to eat
+	bra	$-1		; "
+	btfsc	PIR1,TMR2IF	;If Timer2 matched while we were waiting, the
+	reset			; signal has changed, so reset
+	movlb	30		;Pass composite sync through to horizontal sync
+	bsf	CLC2POL,0	; again
+	decfsz	X0,F		;Count down serrated pulses and loop if there
+	bra	PwmSyn4		; are more
+PwmSyn6	movlb	0		;Stop Timer1 if it was running
+	clrf	T1CON		; "
+	movf	T1SKPH,W	;Set up Timer1 to skip enough rising edges on
+	movwf	TMR1H		; composite sync that it takes us to the next
+	movf	T1SKPL,W	; vertical sync area
 	movwf	TMR1L		; "
-	return			;Done
+	call	SleepUntilTimer1;Sleep until that happens
+	bra	PwmSynthesis	;Loop
 
-;Start Timer1 and go to sleep, having it wake us after the preset number of
-; edges on composite/horizontal sync.
-;Clobbers: BSR (0)
-SleepEdge
-	movlb	0		;Start Timer1
-	bsf	T1CON,TMR1ON	; "
-	sleep			;Sleep until awakened by Timer1
-	return			;Done
-
-;Wait for composite sync to be low.
-;Clobbers: BSR (0)
-WaitForLow
-	movlb	0		;Wait for composite sync to be low
-	btfsc	PORTA,CS_PIN	; "
+;Passthrough synthesis for when VISFLAT is clear.
+PassSynthesis
+	movf	SERPRE,W	;Initialize a counter of pre-vertical serrated
+	btfsc	STATUS,Z	; pulses or skip ahead if there aren't any
+	bra	PassSy1		; "
+	movwf	X0		; "
+PassSy0	clrf	INDF1		;Wait for a falling edge on composite sync
+	btfss	INTCON,IOCIF	; "
 	bra	$-1		; "
-	return			;Done
-
-;Wait for composite sync to be high.
-;Clobbers: BSR (0)
-WaitForHigh
-	movlb	0		;Wait for composite sync to be high
-	btfss	PORTA,CS_PIN	; "
+	call	ThreeFourths	;Timer2 to match after 3/4 normal pulse width
+	movlb	30		;Latch high state of composite sync to
+	bcf	CLC2POL,0	; horizontal sync
+	clrf	INDF1		;Clear falling edge and Timer2 flags
+	movlb	0		; "
+	clrf	PIR1		; "
+	btfss	INTCON,IOCIF	;Wait for the serration that we want to eat
 	bra	$-1		; "
-	return			;Done
-
-;Force horizontal sync high until composite sync goes high, then pass composite
-; through to horizontal again.
-;Clobbers: BSR (30)
-ForceHSyncHigh
-	movlb	30		;Set the transparent latch to hold its state
-	clrf	CLC2GLS0	; "
-	movlw	B'00000011'	;Momentarily actuate the S line
-	movwf	CLC2GLS3	; "
-	clrf	CLC2GLS3	; "
+	btfsc	PIR1,TMR2IF	;If Timer2 matched while we were waiting, the
+	reset			; signal has changed, so reset
+	movlb	30		;Pass composite sync through to horizontal sync
+	bsf	CLC2POL,0	; again
+	decfsz	X0,F		;Count down serrated pulses and loop if there
+	bra	PassSy0		; are more
+PassSy1	movlb	30		;Gate PWM1 into horizontal sync output (make it
+	bsf	CLC2GLS1,7	; low if both PWM1 and composite sync are low)
+	bcf	CLC1GLS0,2	;Disconnect horizontal sync from the vert clock
+	bsf	CLC1GLS2,2	;Make vertical sync go low when horizontal does
+	call	HoldTimer2	;Hold Timer2 until falling edge on composite
+	decf	VPULSES,W	;Initialize a counter of pulses to let pass
+	movwf	X0		; "
+PassSy2	clrf	PIR1		;Wait for Timer2 to match that many times
+	btfss	PIR1,TMR2IF	; "
+	bra	$-1		; "
+	decfsz	X0,F		; "
+	bra	PassSy2		; "
+	movlb	0		;Stop Timer1 if it was running and set it up to
+	clrf	T1CON		; skip enough rising edges on composite sync
+	movf	T1SKPH,W	; that it takes us to the next vertical sync
+	movwf	TMR1H		; area - we won't have time enough to do this
+	movf	T1SKPL,W	; later, so do it now
+	movwf	TMR1L		; "
+	movlb	30		;Disconnect the reset input of vertical sync
+	bcf	CLC1GLS2,2	; from the complement of horizontal sync
+	btfss	CLC2CON,LC2OUT	;Wait for PWM to go high
+	bra	$-1		; "
+	bsf	CLC1GLS0,2	;Make vertical sync go high when horiz goes low
+	movlb	0		;If composite sync isn't low at this point, the
+	btfsc	PORTA,CS_PIN	; signal has changed, reset
+	reset			; "
+	movlb	30		;Latch high state of horizontal sync
+	bcf	CLC2POL,0	; "
+	bcf	CLC2GLS1,7	;Take PWM1 out of gate for horizontal sync
 	movlb	0		;Wait for composite sync to go high
 	btfss	PORTA,CS_PIN	; "
 	bra	$-1		; "
-	movlb	30		;Set the transparent latch to feed composite
-	movwf	CLC2GLS0	; sync through again
-	return			;Done
+	movlb	30		;Pass composite sync through to horizontal sync
+	bsf	CLC2POL,0	; again
+	movf	SERPOST,W	;Initialize a counter of post-vertical serrated
+	btfsc	STATUS,Z	; pulses or skip ahead if there aren't any
+	bra	PassSy5		; "
+	movwf	X0		; "
+PassSy3	clrf	INDF1		;Wait for a falling edge on composite sync
+	btfss	INTCON,IOCIF	; "
+	bra	$-1		; "
+	call	ThreeFourths	;Timer2 to match after 3/4 normal pulse width
+	movlb	30		;Latch high state of composite sync to
+PassSy4	bcf	CLC2POL,0	; horizontal sync
+	clrf	INDF1		;Clear falling edge and Timer2 flags
+	movlb	0		; "
+	clrf	PIR1		; "
+	btfss	INTCON,IOCIF	;Wait for the serration that we want to eat
+	bra	$-1		; "
+	btfsc	PIR1,TMR2IF	;If Timer2 matched while we were waiting, the
+	reset			; signal has changed, so reset
+	movlb	30		;Pass composite sync through to horizontal sync
+	bsf	CLC2POL,0	; again
+	decfsz	X0,F		;Count down serrated pulses and loop if there
+	bra	PassSy3		; are more
+PassSy5	call	SleepUntilTimer1;Sleep until next vertical sync area
+	bra	PassSynthesis	;Loop
 
-;Wait for composite sync to go high, latch it high on horizontal sync, then
-; wait for another pulse to pass by on composite sync, then pass composite sync
-; through to horizontal sync again.
-;Clobbers: BSR (30)
-EatPulse
-	movlb	7		;Set IOC to catch rising edges on composite
-	movlw	1 << CS_PIN	; sync
-	movwf	IOCAP		; "
-	clrf	IOCAN		; "
-	movlb	0		;Wait for composite sync to go high
-	btfss	PORTA,CS_PIN	; "
-	bra	$-1		; "
-	movlb	7		;Clear the rising edge IOC just caught
-	clrf	IOCAF		; "
-	movlb	30		;Set the transparent latch to hold its state
-	clrf	CLC2GLS0	; "
-	movlw	B'00000011'	;Prepare to undo the previous
-	btfss	INTCON,IOCIF	;Wait for a rising edge on composite sync
-	bra	$-1		; "
-	movwf	CLC2GLS0	;Feed composite sync through again
-	return			;Done
 
-;Split a single flat vertical pulse into multiple correctly-spaced horizontal
-; pulses.
-;Clobbers: X0 (0), BSR (30)
-SplitSingleFlat
-	movf	VSYNTH,W	;Set the counter for the number of synthetic
-	movwf	X0		; horizontal pulses to create
-	movlb	7		;Set IOC to detect premature rise of composite
-	movlw	1 << CS_PIN	; sync (which would imply a sync change and
-	movwf	IOCAP		; necessitate a reset)
-	clrf	IOCAN		; "
-	clrf	IOCAF		; "
-	movlb	30		;Set vertical sync to go low when horizontal
-	clrf	CLC1GLS1	; sync (which is passed through from composite
-	bcf	CLC1GLS0,1	; sync) does
-	movlb	1		;Set Timer0 so that it overflows on the next
-	bsf	OPTION_REG,TMR0CS; falling transition on T0CKI (which happens
-	movlb	0		; to also be the vertical sync output)
-	movlw	0xFF		; "
-	movwf	TMR0		; "
-	clrf	T1CON		;Stop Timer1 if it was started and load it with
-	movlw	6		; a value that we want to increment in sync
-	movwf	TMR1L		; with the arrival of the vertical pulse
-	movlw	B'11111001'	;Set the Timer1 gate to start Timer1 as soon as
-	movwf	T1GCON		; pulse arrives (passed from composite sync to
-	bsf	T1CON,TMR1ON	; horizontal sync to vertical sync to T0CKI)
-	btfss	T1GCON,T1GVAL	; "
-	bra	$-1		; "
-	movf	TMR1L,W		;Set Timer2 from Timer1 and disable the gate so
-	clrf	T1GCON		; anything else using Timer1 won't be messed up
-	movwf	TMR2		; by it
-	movlb	30		;Set horizontal sync DFF to be set low by
-	bsf	CLC2GLS2,3	; Timer2
-SplSng0	movlw	B'00000011'	;Set vertical sync DFF to hold its clock high
-	movwf	CLC1GLS1	; and raise its input in preparation for later
-	movwf	CLC1GLS0	; "
-	clrf	CLC2GLS0	;Set transparent latch to hold its state then
-	movwf	CLC2GLS3	; momentarily actuate the S line so horizontal
-	clrf	CLC2GLS3	; sync goes high
-	btfsc	INTCON,IOCIF	;If at any time a rising edge was detected on
-	reset			; composite sync, signal's changed, reset
-	decf	X0,F		;Decrement the counter of synthetic horizontal
-	btfsc	STATUS,Z	; pulses that remain; if this is the last one,
-	bcf	CLC1GLS0,1	; vertical sync rises when horizontal falls
-	btfsc	CLC2CON,LC2OUT	;Wait until horizontal sync DFF has been set
-	bra	$-1		; low by Timer2
-	movwf	CLC2GLS0	;Pass composite sync through to horizontal sync
-	btfss	STATUS,Z	;If this is not the last synthetic horizontal
-	bra	SplSng0		; pulse, loop
-	movlb	0		;Wait for composite sync to go high
-	btfss	PORTA,CS_PIN	; "
-	bra	$-1		; "
-	movlb	30		;Set vertical sync DFF to hold its clock high
-	bsf	CLC1GLS0,1	; "
-	bcf	CLC2GLS2,3	;Disconnect Timer2 from horizontal sync DFF
-	return			;Done
+;;; Subprograms ;;;
 
 ;Transmit a space over the pseudo UART.
 ;Clobbers: X0 (0), BSR (0)
@@ -728,439 +903,237 @@ UartTxHex
 	addlw	0x3A		; "
 	bra	UartTx		;Transmit it
 
-;Write the contents of the SRAM buffer, in hex, to the UART.
-;Clobbers: X1, X0 (0), FSR0 (0x2030), BSR (0)
-UartTxHexDump
-	movlw	0x20		;Put FSR0 at the beginning of the SRAM buffer
-	movwf	FSR0H		; "
-	clrf	FSR0L		; "
-UaTxHD0	moviw	FSR0++		;Transmit next byte
-	call	UartTxHex	; "
-	movlw	0x20		;Transmit a space
-	call	UartTx		; "
-	movf	FSR0L,W		;If we're at a 16-byte boundary, transmit a
-	andlw	B'00001111'	; newline
-	btfss	STATUS,Z	; "
-	bra	UaTxHD1		; "
-	movlw	0x0D		; "
-	call	UartTx		; "
-	movlw	0x0A		; "
-	call	UartTx		; "
-UaTxHD1	movf	FSR0L,W		;If we've written out the whole buffer, done,
-	xorlw	0x30		; else loop
-	btfss	STATUS,Z	; "
-	bra	UaTxHD0		; "
-	return			; "
+;Convert the number in W into an ASCII and put it to the UART.
+UartTxDecShort
+	movwf	X0		;Save the caller a bit of space by writing the
+	clrf	X1		; number in W to X0 and clearing X1
+	;fall through
 
-;Profile the vertical pulses and the surrounding area in the composite sync
-; signal, loading the 48-byte SRAM buffer with it.  Composite sync must be fed
-; through CLC2 (so it's readable as the T1CKI pin) before calling.  Also sets
-; HPULSEH:L.
-;Clobbers: FSR1 (IOCAF), FSR0 (0x2040), BSR (0)
-ProfileSignal
-	movlw	0x20		;Point FSR0 to start of 48-byte linear SRAM
-	movwf	FSR0H		; buffer
-	clrf	FSR0L		; "
-	movlw	high IOCAF	;Point FSR1 to IOCAF for ease of clearing
-	movwf	FSR1H		; "
-	movlw	low IOCAF	; "
-	movwf	FSR1L		; "
-	clrf	HPULSEH		;Clear the horizontal (short) pulse count
-	clrf	HPULSEL		; "
-	movlb	1		;Get Timer1 set up to interrupt when peripheral
-	movlw	1 << TMR1IE	; interrupts are enabled
-	movwf	PIE1		; "
-	movlb	0		; "
-	clrf	T1CON		; "
-	clrf	PIR1		; "
-	movlb	7		;Get IOC set up to catch falling edges
-	movlw	1 << CS_PIN	; "
-	movwf	IOCAN		; "
-	clrf	IOCAP		; "
-	movlb	0		; "
-	movlw	1 << GIE	;Make sure interrupt subsystem is on (but not
-	movwf	INTCON		; yet the IOC interrupt source)
-Profil0	call	Profil5		;Wait for a short pulse in case we're already
-	btfss	PORTA,CS_PIN	; in the middle of vertical sync
-	bra	Profil0		; "
-Profil1	call	Profil5		;Wait for a long pulse so we can find the
-	btfsc	PORTA,CS_PIN	; vertical sync
-	bra	Profil1		; "
-Profil2	call	Profil5		;Wait for a short pulse again so we can start
-	btfss	PORTA,CS_PIN	; counting them
-	bra	Profil2		; "
-Profil3	incf	HPULSEL,F	;Increment the horizontal pulse count
+;Convert the number in X1:0 into an ASCII number and put it to the UART.
+;Clobbers: X4:X0, BSR (0)
+UartTxDecimal
+	movlb	0		;Clear the BCD space
+	clrf	X4		; "
+	clrf	X3		; "
+	clrf	X2		; "
+	bsf	STATUS,C	;Use this 1 as an end sentinel
+UaTxDe0	rlf	X0,F		;Rotate
+	rlf	X1,F		; "
+	rlf	X2,F		; "
+	rlf	X3,F		; "
+	rlf	X4,F		; "
+	rlf	X1,W		;Check if we're done dabbling and skip ahead if
+	iorwf	X0,W		; we are
 	btfsc	STATUS,Z	; "
-	incf	HPULSEH,F	; "
-	call	Profil5		;Wait for a pulse, loop to count it if it's
-	btfsc	PORTA,CS_PIN	; short or finish the count if it's long
-	bra	Profil3		; "
-	movlw	10		;Subtract the horizontal pulse count from a
-	movwf	TMR1L		; constant offset to get the number of positive
-	clrf	TMR1H		; edges (negated) that Timer1 should count
-	movf	HPULSEL,W	; before waking up and profiling the composite
-	subwf	TMR1L,F		; sync signal during and surrounding the
-	movf	HPULSEH,W	; vertical sync interval
-	subwfb	TMR1H,F		; "
-	movlw	B'10000101'	;Arm Timer1 to count up and then wake us from
-	movwf	T1CON		; sleep (we should be in the period where
-	bsf	INTCON,PEIE	; composite sync is high before a horizontal
-	sleep			; pulse)
-	movlw	0		;Start W off at zero
-	btfsc	PORTA,CS_PIN	;Wait until that pulse begins
-	bra	$-1		; "
-	addlw	1		;Measure and record down cycle of 1st pulse
-	btfss	PORTA,CS_PIN	; "
-	bra	$-2		; "
-	movwi	FSR0++		; "
-	addlw	1		;Measure and record up cycle of 1st pulse
-	btfsc	PORTA,CS_PIN	; "
-	bra	$-2		; "
-	movwi	FSR0++		; "
-	addlw	1		;Measure and record down cycle of 2nd pulse
-	btfss	PORTA,CS_PIN	; "
-	bra	$-2		; "
-	movwi	FSR0++		; "
-	addlw	1		;Measure and record up cycle of 2nd pulse
-	btfsc	PORTA,CS_PIN	; "
-	bra	$-2		; "
-	movwi	FSR0++		; "
-	addlw	1		;Measure and record down cycle of 3rd pulse
-	btfss	PORTA,CS_PIN	; "
-	bra	$-2		; "
-	movwi	FSR0++		; "
-	addlw	1		;Measure and record up cycle of 3rd pulse
-	btfsc	PORTA,CS_PIN	; "
-	bra	$-2		; "
-	movwi	FSR0++		; "
-	addlw	1		;Measure and record down cycle of 4th pulse
-	btfss	PORTA,CS_PIN	; "
-	bra	$-2		; "
-	movwi	FSR0++		; "
-	addlw	1		;Measure and record up cycle of 4th pulse
-	btfsc	PORTA,CS_PIN	; "
-	bra	$-2		; "
-	movwi	FSR0++		; "
-	addlw	1		;Measure and record down cycle of 5th pulse
-	btfss	PORTA,CS_PIN	; "
-	bra	$-2		; "
-	movwi	FSR0++		; "
-	addlw	1		;Measure and record up cycle of 5th pulse
-	btfsc	PORTA,CS_PIN	; "
-	bra	$-2		; "
-	movwi	FSR0++		; "
-	addlw	1		;Measure and record down cycle of 6th pulse
-	btfss	PORTA,CS_PIN	; "
-	bra	$-2		; "
-	movwi	FSR0++		; "
-	addlw	1		;Measure and record up cycle of 6th pulse
-	btfsc	PORTA,CS_PIN	; "
-	bra	$-2		; "
-	movwi	FSR0++		; "
-	addlw	1		;Measure and record down cycle of 7th pulse
-	btfss	PORTA,CS_PIN	; "
-	bra	$-2		; "
-	movwi	FSR0++		; "
-	addlw	1		;Measure and record up cycle of 7th pulse
-	btfsc	PORTA,CS_PIN	; "
-	bra	$-2		; "
-	movwi	FSR0++		; "
-	addlw	1		;Measure and record down cycle of 8th pulse
-	btfss	PORTA,CS_PIN	; "
-	bra	$-2		; "
-	movwi	FSR0++		; "
-	addlw	1		;Measure and record up cycle of 8th pulse
-	btfsc	PORTA,CS_PIN	; "
-	bra	$-2		; "
-	movwi	FSR0++		; "
-	addlw	1		;Measure and record down cycle of 9th pulse
-	btfss	PORTA,CS_PIN	; "
-	bra	$-2		; "
-	movwi	FSR0++		; "
-	addlw	1		;Measure and record up cycle of 9th pulse
-	btfsc	PORTA,CS_PIN	; "
-	bra	$-2		; "
-	movwi	FSR0++		; "
-	addlw	1		;Measure and record down cycle of 10th pulse
-	btfss	PORTA,CS_PIN	; "
-	bra	$-2		; "
-	movwi	FSR0++		; "
-	addlw	1		;Measure and record up cycle of 10th pulse
-	btfsc	PORTA,CS_PIN	; "
-	bra	$-2		; "
-	movwi	FSR0++		; "
-	addlw	1		;Measure and record down cycle of 11th pulse
-	btfss	PORTA,CS_PIN	; "
-	bra	$-2		; "
-	movwi	FSR0++		; "
-	addlw	1		;Measure and record up cycle of 11th pulse
-	btfsc	PORTA,CS_PIN	; "
-	bra	$-2		; "
-	movwi	FSR0++		; "
-	addlw	1		;Measure and record down cycle of 12th pulse
-	btfss	PORTA,CS_PIN	; "
-	bra	$-2		; "
-	movwi	FSR0++		; "
-	addlw	1		;Measure and record up cycle of 12th pulse
-	btfsc	PORTA,CS_PIN	; "
-	bra	$-2		; "
-	movwi	FSR0++		; "
-	addlw	1		;Measure and record down cycle of 13th pulse
-	btfss	PORTA,CS_PIN	; "
-	bra	$-2		; "
-	movwi	FSR0++		; "
-	addlw	1		;Measure and record up cycle of 13th pulse
-	btfsc	PORTA,CS_PIN	; "
-	bra	$-2		; "
-	movwi	FSR0++		; "
-	addlw	1		;Measure and record down cycle of 14th pulse
-	btfss	PORTA,CS_PIN	; "
-	bra	$-2		; "
-	movwi	FSR0++		; "
-	addlw	1		;Measure and record up cycle of 14th pulse
-	btfsc	PORTA,CS_PIN	; "
-	bra	$-2		; "
-	movwi	FSR0++		; "
-	addlw	1		;Measure and record down cycle of 15th pulse
-	btfss	PORTA,CS_PIN	; "
-	bra	$-2		; "
-	movwi	FSR0++		; "
-	addlw	1		;Measure and record up cycle of 15th pulse
-	btfsc	PORTA,CS_PIN	; "
-	bra	$-2		; "
-	movwi	FSR0++		; "
-	addlw	1		;Measure and record down cycle of 16th pulse
-	btfss	PORTA,CS_PIN	; "
-	bra	$-2		; "
-	movwi	FSR0++		; "
-	addlw	1		;Measure and record up cycle of 16th pulse
-	btfsc	PORTA,CS_PIN	; "
-	bra	$-2		; "
-	movwi	FSR0++		; "
-	addlw	1		;Measure and record down cycle of 17th pulse
-	btfss	PORTA,CS_PIN	; "
-	bra	$-2		; "
-	movwi	FSR0++		; "
-	addlw	1		;Measure and record up cycle of 17th pulse
-	btfsc	PORTA,CS_PIN	; "
-	bra	$-2		; "
-	movwi	FSR0++		; "
-	addlw	1		;Measure and record down cycle of 18th pulse
-	btfss	PORTA,CS_PIN	; "
-	bra	$-2		; "
-	movwi	FSR0++		; "
-	addlw	1		;Measure and record up cycle of 18th pulse
-	btfsc	PORTA,CS_PIN	; "
-	bra	$-2		; "
-	movwi	FSR0++		; "
-	addlw	1		;Measure and record down cycle of 19th pulse
-	btfss	PORTA,CS_PIN	; "
-	bra	$-2		; "
-	movwi	FSR0++		; "
-	addlw	1		;Measure and record up cycle of 19th pulse
-	btfsc	PORTA,CS_PIN	; "
-	bra	$-2		; "
-	movwi	FSR0++		; "
-	addlw	1		;Measure and record down cycle of 20th pulse
-	btfss	PORTA,CS_PIN	; "
-	bra	$-2		; "
-	movwi	FSR0++		; "
-	addlw	1		;Measure and record up cycle of 20th pulse
-	btfsc	PORTA,CS_PIN	; "
-	bra	$-2		; "
-	movwi	FSR0++		; "
-	addlw	1		;Measure and record down cycle of 21st pulse
-	btfss	PORTA,CS_PIN	; "
-	bra	$-2		; "
-	movwi	FSR0++		; "
-	addlw	1		;Measure and record up cycle of 21st pulse
-	btfsc	PORTA,CS_PIN	; "
-	bra	$-2		; "
-	movwi	FSR0++		; "
-	addlw	1		;Measure and record down cycle of 22nd pulse
-	btfss	PORTA,CS_PIN	; "
-	bra	$-2		; "
-	movwi	FSR0++		; "
-	addlw	1		;Measure and record up cycle of 22nd pulse
-	btfsc	PORTA,CS_PIN	; "
-	bra	$-2		; "
-	movwi	FSR0++		; "
-	addlw	1		;Measure and record down cycle of 23rd pulse
-	btfss	PORTA,CS_PIN	; "
-	bra	$-2		; "
-	movwi	FSR0++		; "
-	addlw	1		;Measure and record up cycle of 23rd pulse
-	btfsc	PORTA,CS_PIN	; "
-	bra	$-2		; "
-	movwi	FSR0++		; "
-	addlw	1		;Measure and record down cycle of 24th pulse
-	btfss	PORTA,CS_PIN	; "
-	bra	$-2		; "
-	movwi	FSR0++		; "
-	addlw	1		;Measure and record up cycle of 24th pulse
-	btfsc	PORTA,CS_PIN	; "
-	bra	$-2		; "
-	movwi	FSR0++		; "
-	clrf	FSR0L		;Adjust recorded measurements so they're based
-	movlw	0		; on zero rather than the previous measurement
-Profil4	subwf	INDF0,F		; "
-	addwf	INDF0,W		; "
-	incf	FSR0L,F		; "
-	btfss	FSR0L,6		; "
-	bra	Profil4		; "
-	return			;Done
-Profil5	btfss	PORTA,CS_PIN	;If we're already in the middle of a pulse,
-	bra	$-1		; wait until it's over
-	clrf	INDF1		;Sleep while we wait for a negative edge on the
-	bsf	INTCON,IOCIE	; composite sync line, then return (typically
-	sleep			; 5 us after the change); caller can check the
-	return			; line state to see if short or long pulse
-
-;Parse parameters out of the profiled signal that are needed to synthesize a
-; horizontal/vertical signal from it.
-;Clobbers: X2, X1, X0, FSR0, BSR (0)
-;Exit codes:
-;0 - success
-;1 - no vertical pulses
-;2 - serrated pulse followed by non-serrated pulse before vertical pulse(s)
-;3 - half serrated pulse followed by vertical pulse
-;4 - half serrated pulse followed by horizontal pulse, pre-vertical
-;5 - no end of vertical pulses
-;6 - no normal horizontal pulse to finish profile
-;7 - half serrated pulse followed by horizontal pulse, post-vertical
-ParseProfile
-	movlw	0x20		;Need this for accessing the profile
-	movwf	FSR0H		; "
-	movlb	0		;Determine horizontal pulse period from the
-	movf	PROF00,W	; average width of the outermost pulses in the
-	addwf	PROF01,W	; profile (no need to divide them as the pulses
-	addwf	PROF02,W	; in the profile are in microseconds and the
-	addwf	PROF03,W	; period needs to be in quarter-microseconds)
-	addwf	PROF2C,W	; "
-	addwf	PROF2D,W	; "
-	addwf	PROF2E,W	; "
-	addwf	PROF2F,W	; "
-	movwf	HPERIOD		; "
-	lsrf	WREG,W		;Multiply horizontal pulse period by 3/4 to get
-	movwf	X0		; a threshold we can use to tell the difference
-	lsrf	WREG,W		; between serrated and non-serrated horizontal
-	addwf	X0,F		; pulses and by 1/4 to get one we can use to
-	movwf	X1		; tell if the final (or only) vertical pulse
-	lsrf	X0,F		; swallowed the first horizontal pulse
-	lsrf	X0,F		; "
-	lsrf	X1,F		; "
-	lsrf	X1,F		; "
-	bcf	FLAGS,VISFLAT	;Clear the single-flat-vertical-pulse flag
-	bcf	FLAGS,VATEANH	;Clear the vertical-ate-a-horizontal-pulse flag
-	clrf	VPULSES		;Clear the vertical pulses count
-	clrf	SERPRE		;Clear the pre-vertical serration pulses count
-	clrf	SERPOST		;Clear the post-vertical serration pulses count
-	clrf	FSR0L		;Rewind the pointer
-ParseP0	movlw	1		;If we've scanned through the profile and not
-	call	ParseP9		; found any vertical pulses, error out
-	movf	INDF0,W		;If the current pulse is long enough to be a
-	sublw	VERTTHR		; vertical pulse, skip ahead to count it as one
-	btfss	STATUS,C	; "
-	bra	ParseP3		; "
-	moviw	FSR0++		;If the current pulse and the uptime following
-	addwf	INDF0,W		; it are short enough to indicate this is a
-	subwf	X0,W		; serrated pulse, skip ahead to count it as one
-	btfsc	STATUS,C	; "
-	bra	ParseP2		; "
-	movf	SERPRE,W	;If this is a normal (non-serrated) horizontal
-	btfss	STATUS,Z	; pulse but we've seen pre-vertical serrated
-	retlw	2		; pulses already, error out
-ParseP1	addfsr	FSR0,1		;Otherwise, advance to the next pulse and loop
-	bra	ParseP0		; "
-ParseP2	addfsr	FSR0,1		;We saw half a serrated pulse, make sure the
-	movf	INDF0,W		; following pulse is the other half; if it is a
-	sublw	VERTTHR		; vertical pulse instead, error out
-	btfss	STATUS,C	; "
-	retlw	3		; "
-	moviw	FSR0++		;If the following pulse is too long to be the
-	addwf	INDF0,W		; other half, error out
-	subwf	X0,W		; "
-	btfss	STATUS,C	; "
-	retlw	4		; "
-	incf	SERPRE,F	;Otherwise, count this as a serrated pulse and
-	bra	ParseP1		; loop
-ParseP3	movf	INDF0,W		;This was a vertical pulse, save its width for
-	movwf	X2		; later use
-	incf	VPULSES,F	;Increment the count of vertical pulses and
-	addfsr	FSR0,2		; move on to the next pulse
-	movlw	5		;If we ran out of profile before seeing the end
-	call	ParseP9		; of vertical pulses, error out
-	movf	INDF0,W		;If the current pulse is long enough to be a
-	sublw	VERTTHR		; vertical pulse, loop to count it as one
-	btfss	STATUS,C	; "
-	bra	ParseP3		; "
-	moviw	--FSR0		;Before we move on, check if the uptime after
-	subwf	X1,W		; last vertical pulse is long enough to suggest
-	btfsc	STATUS,C	; that it swallowed the first horizontal pulse
-	bra	ParseP4		; following it; if not, skip ahead
-	bsf	FLAGS,VATEANH	;If so, set the flag that says so
-	moviw	FSR0++		;This is cheating a little, but reckon whether
-	addwf	INDF0,W		; the pulse that was swallowed was serrated or
-	subwf	X0,W		; not by adding the downtime following the
-	btfsc	STATUS,C	; vertical pulse to the uptime following it; if
-	bra	ParseP5		; serrated, skip ahead to make sure there's a
-	bra	ParseP6		; second half, else skip (further) ahead
-ParseP4	addfsr	FSR0,1		;If we ran out of profile before finding one
-	movlw	6		; normal horizontal pulse, error out
-	call	ParseP9		; "
-	moviw	FSR0++		;If the current pulse and the uptime following
-	addwf	INDF0,W		; it are short enough to indicate that it's a
-	subwf	X0,W		; serrated pulse, proceed to check for the
-	btfss	STATUS,C	; other half, else skip ahead
-	bra	ParseP6		; "
-	addfsr	FSR0,1		;Check whether the following pulse is the other
-ParseP5	moviw	FSR0++		; half of the serrated pulse; if it's not,
-	addwf	INDF0,W		; error out, else count it and loop
-	subwf	X0,W		; "
-	btfss	STATUS,C	; "
-	retlw	7		; "
-	incf	SERPOST,F	; "
-	bra	ParseP4		; "
-ParseP6	decf	VPULSES,W	;If there's more than one vertical pulse, we're
-	btfss	STATUS,Z	; done and successful
-	retlw	0		; "
-	clrf	VSYNTH		;If not, we need to count the number of pulses
-	lsrf	HPERIOD,W	; that there should be, so take the length of
-	lsrf	WREG,W		; our one vertical pulse and divide it by the
-	movwf	X0		; horizontal period
-	lsrf	X0,W		; "
+	bra	UaTxDe1		; "
+	movlw	0x33		;Set high bits of each nibble if they're >= 5
 	addwf	X2,F		; "
-ParseP7	movf	X0,W		; "
-	subwf	X2,F		; "
-	btfss	STATUS,C	; "
-	bra	ParseP8		; "
-	incf	VSYNTH,F	; "
-	bra	ParseP7		; "
-ParseP8	decf	VSYNTH,W	;If the result is more than one, set the flag
-	btfss	STATUS,Z	; to indicate that the vertical pulse is flat
-	bsf	FLAGS,VISFLAT	; and we should synthesize horizontal pulses
-	retlw	0		; across it; either way, return success
-ParseP9	btfsc	FSR0L,4		;If we haven't gone off the end of the profile,
-	btfss	FSR0L,5		; everything's okay, return to caller
-	return			; "
-	movlb	31		;Otherwise, return to caller's caller with the
-	decf	STKPTR,F	; exit code in W
-	return			; "
-	
+	addwf	X3,F		; "
+	btfsc	X2,3		;If the low nibble's high bit was set, adjust
+	addlw	-3		; so we don't subtract from it
+	btfsc	X2,7		;If the high nibble's high bit was set, adjust
+	addlw	(-3)<<4		; so we don't subtract from it
+	subwf	X2,F		;Do the subtraction
+	movlw	0x33		;Reload 0x33 into W to adjust the middle reg
+	btfsc	X3,3		;If the low nibble's high bit was set, adjust
+	addlw	-3		; so we don't subtract from it
+	btfsc	X3,7		;If the high nibble's high bit was set, adjust
+	addlw	(-3)<<4		; so we don't subtract from it
+	subwf	X3,F		;Do the subtraction
+	bcf	STATUS,C	;Clear carry so we don't rotate another one in
+	bra	UaTxDe0		;Loop
+UaTxDe1	movf	X4,W		;Convert the packed BCD representation into
+	movwf	X0		; unpacked BCD representation (slightly out of
+	movf	X2,W		; order: X0, X3, X2, X1, X4; this way we don't
+	andlw	0x0F		; mind that UartTx clobbers X0)
+	movwf	X4		; "
+	swapf	X2,W		; "
+	andlw	0x0F		; "
+	movwf	X1		; "
+	movf	X3,W		; "
+	andlw	0x0F		; "
+	movwf	X2		; "
+	swapf	X3,W		; "
+	andlw	0x0F		; "
+	movwf	X3		; "
+	movf	X0,W		;Skip ahead as necessary so as not to print
+	btfss	STATUS,Z	; leading zeroes
+	bra	UaTxDe2		; "
+	movf	X3,W		; "
+	btfss	STATUS,Z	; "
+	bra	UaTxDe3		; "
+	movf	X2,W		; "
+	btfss	STATUS,Z	; "
+	bra	UaTxDe4		; "
+	movf	X1,W		; "
+	btfss	STATUS,Z	; "
+	bra	UaTxDe5		; "
+	bra	UaTxDe6		; "
+UaTxDe2	movf	X0,W		;Convert each unpacked BCD digit into ASCII and
+	iorlw	0x30		; put them to the UART
+	call	UartTx		; "
+UaTxDe3	movf	X3,W		; "
+	iorlw	0x30		; "
+	call	UartTx		; "
+UaTxDe4	movf	X2,W		; "
+	iorlw	0x30		; "
+	call	UartTx		; "
+UaTxDe5	movf	X1,W		; "
+	iorlw	0x30		; "
+	call	UartTx		; "
+UaTxDe6	movf	X4,W		; "
+	iorlw	0x30		; "
+	call	UartTx		; "
+	return			;Done
+
+;Start Timer1 counting pulses on T1CKI and sleep until it overflows.
+;Clobbers: BSR (0)
+SleepUntilTimer1
+	movlb	0		;Arm Timer1 to count up and then wake us from
+	movlw	B'10000101'	; sleep (we should be in the period where
+	movwf	T1CON		; composite sync is high before a horizontal
+	movlw	1 << PEIE	; pulse, (SPULSES * 2) + 1 pulses before
+	movwf	INTCON		; vertical)
+	clrf	PIR1		; "
+	sleep			;Sleep until Timer1 overflows
+	return			;Done
+
+;Set Timer2 so it overflows after three fourths its period.
+;Clobbers: BSR (0)
+ThreeFourths
+	movlb	0		;Divide Timer2 period register by four and set
+	lsrf	PR2,W		; Timer2 to it
+	lsrf	WREG,W		; "
+	movwf	TMR2		; "
+	return			;Done
+
+;Roughly measure a pulse on composite sync using threshold VERTTHR.  Return
+; with Z clear for a short (horizontal) pulse, set for a long (vertical) pulse.
+;Clobbers: BSR (0)
+MeasurePulse
+	clrf	INDF1		;Wait for a falling edge on composite sync
+	btfss	INDF1,CS_PIN	; (INDF1 is IOCAF)
+	bra	$-1		; "
+	movlw	VERTTHR-1	;Wait VERTTHR - 1 microseconds (the delay in
+MeasPu0	nop			; triggering on IOCAF and the delay afterwards
+	decfsz	WREG,W		; add up to another microsecond
+	bra	MeasPu0		; "
+	movlb	0		;Grab the state of the composite sync pin and
+	movf	PORTA,W		; return with it in W (Z will be clear if the
+	andlw	1 << CS_PIN	; pulse was short and set if it was long)
+	return			;Done
+
+;Get the value of Timer2 at the time of the start of the next composite sync
+; pulse, returning it in W.
+;Clobbers: BSR (0)
+TimeNextPulse
+	clrf	INDF1		;Clear any past edge
+	clrf	INTCON		;Enable only IOC interrupt, going to interrupt
+	bsf	INTCON,IOCIE	; handler not yet enabled
+	movlb	0		;Grab a first value of Timer2 in case edge was
+	movf	TMR2,W		; already triggered
+	bsf	INTCON,GIE	;Enable interrupt handler
+TiNePu0	movf	TMR2,W		;Repeatedly grab the value of Timer2 until the
+	movf	TMR2,W		; interrupt handler triggers and returns us to
+	movf	TMR2,W		; caller
+	movf	TMR2,W		; "
+	movf	TMR2,W		; "
+	movf	TMR2,W		; "
+	movf	TMR2,W		; "
+	movf	TMR2,W		; "
+	movf	TMR2,W		; "
+	movf	TMR2,W		; "
+	movf	TMR2,W		; "
+	movf	TMR2,W		; "
+	movf	TMR2,W		; "
+	movf	TMR2,W		; "
+	movf	TMR2,W		; "
+	movf	TMR2,W		; "
+	movf	TMR2,W		; "
+	movf	TMR2,W		; "
+	movf	TMR2,W		; "
+	movf	TMR2,W		; "
+	movf	TMR2,W		; "
+	movf	TMR2,W		; "
+	movf	TMR2,W		; "
+	movf	TMR2,W		; "
+	movf	TMR2,W		; "
+	movf	TMR2,W		; "
+	movf	TMR2,W		; "
+	movf	TMR2,W		; "
+	movf	TMR2,W		; "
+	movf	TMR2,W		; "
+	movf	TMR2,W		; "
+	movf	TMR2,W		; "
+	;TODO more?
+	bra	TiNePu0		;Loop
+
+;Hold Timer2 at zero (and PWM1 active) until the start of the next composite
+; sync pulse.
+;Clobbers: BSR (0)
+HoldTimer2
+	movlb	0		;Set Timer2 to its period so when it ticks, the
+	movf	PR2,W		; PWM is in active mode
+	movwf	TMR2		; "
+	clrf	INDF1		;Clear any past edge
+	clrf	INTCON		;Enable only IOC interrupt, going to interrupt
+	bsf	INTCON,IOCIE	; handler not yet enabled
+	bsf	INTCON,GIE	;Enable interrupt handler
+	movlw	1		;Repeatedly clear Timer2 until the interrupt
+HoldT20	movwf	TMR2		; handler triggers and returns us to caller
+	movwf	TMR2		; "
+	movwf	TMR2		; "
+	movwf	TMR2		; "
+	movwf	TMR2		; "
+	movwf	TMR2		; "
+	movwf	TMR2		; "
+	movwf	TMR2		; "
+	movwf	TMR2		; "
+	movwf	TMR2		; "
+	movwf	TMR2		; "
+	movwf	TMR2		; "
+	movwf	TMR2		; "
+	movwf	TMR2		; "
+	movwf	TMR2		; "
+	movwf	TMR2		; "
+	movwf	TMR2		; "
+	movwf	TMR2		; "
+	movwf	TMR2		; "
+	movwf	TMR2		; "
+	movwf	TMR2		; "
+	movwf	TMR2		; "
+	movwf	TMR2		; "
+	movwf	TMR2		; "
+	movwf	TMR2		; "
+	movwf	TMR2		; "
+	movwf	TMR2		; "
+	movwf	TMR2		; "
+	movwf	TMR2		; "
+	movwf	TMR2		; "
+	movwf	TMR2		; "
+	movwf	TMR2		; "
+	;TODO more?
+	bra	HoldT20		; "
+
 
 ;;; Strings ;;;
 
-SPOR	da	"Welcome to TashSync 20250607\r\n\x00"
+SPOR	da	"Welcome to TashSync 20250624\r\n\x00"
 SWDTR	da	"sync timeout\r\n\x00"
 SReset	da	"sync change\r\n\x00"
 SErrorR	da	"serious error\r\n\x00"
-SProfil	da	"Profiling...\x00"
-SProfOk	da	"ok.\r\n\r\nTrace:\r\n\x00"
-SHeader	da	"HP   HT VP Pr Po VF VE"
+SPassTh	da	"No composite sync detected, using passthrough mode.\r\n\x00"
+STrace	da	"Composite sync detected.\r\nTrace:\r\n\x00"
+SRpt0	da	"VPulses: \x00"
+SRpt1	da	"\r\nHPulses: \x00"
+SRpt2	da	"\r\nHPeriod: \x00"
+SRpt3	da	" cyc / \x00"
+SRpt4	da	" us\x00"
+SRpt5	da	"\r\nSerPre: \x00"
+SRpt6	da	"\r\nSerPost: \x00"
+SRpt7	da	"\r\nVSynth: \x00"
 SCRLF	da	"\r\n"
 SNull	da	"\x00"
-SYes	da	"Y  \x00"
-SNo	da	"N  \x00"
 
 
 ;;; End of Program ;;;
