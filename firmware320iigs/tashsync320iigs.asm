@@ -49,12 +49,6 @@
 
 ;;; Macros ;;;
 
-DELAY	macro	value		;Delay 3*W cycles, set W to 0
-	movlw	value
-	decfsz	WREG,F
-	goto	$-1
-	endm
-
 DNOP	macro
 	goto	$+1
 	endm
@@ -249,6 +243,21 @@ Loop1	movlw	1 << INTE	;Set us to wake on a primary edge
 	movwf	CLC1GLS1	; "
 	movlw	1 << INTEDG	;Toggle INTEDG so INT interrupt fires on
 	xorwf	OPTION_REG,F	; secondary edge of composite sync
+	bcf	STATUS,C	;Set Timer0 so it overflows at approximately the
+	rrf	HPERIOD,W	; halfway point between horizontal pulses
+	xorlw	0xFF		; "
+	addlw	20		; "
+	movwf	TMR0		; "
+	movlw	0		;Copy the NEGPULS flag into W at the position
+	btfsc	FLAGS,NEGPULS	; corresponding to the composite sync pin in
+	movlw	1 << CS_PIN	; PORTA
+	clrf	INTCON		;Wait for Timer0 to overflow
+	btfss	INTCON,TMR0IF	; "
+	goto	$-1		; "
+	xorwf	PORTA,W		;Get the state of the composite sync pin,
+	andlw	1 << CS_PIN	; inverting it if NEGPULS was set
+	btfsc	STATUS,Z	;If the composite sync pin is inactive now, the
+	goto	SignalChange	; signal has changed and we should reanalyze it
 	bsf	FLAGS,IHGOTO	;Set interrupt handler to return to Loop2
 	movlw	B'10010000'	;Set interrupt handler to fire on secondary edge
 	movwf	INTCON		; of composite sync
@@ -268,30 +277,17 @@ Loop3	movlw	1 << INTE	;Set us to wake on a secondary edge
 	xorwf	OPTION_REG,F	; edge of composite sync
 	goto	Loop		;Back pre vertical inversion, repeat main loop
 
+SignalChange
+	movlw	B'00000001'	;We have no reset instruction on this PIC so set
+	movwf	WDTCON		; the WDT to its shortest interval and loop
+	goto	$		; until it resets us
+
 NopField
 	nop			;Minimize interrupt latency in an infinite loop;
 	nop			; interrupt would be delayed by one cycle if the
 	nop			; edge happened in the first half of a goto
 	nop			; instruction, but this way the probability of
 	nop			; that happening is significantly lowered
-	nop			; "
-	nop			; "
-	nop			; "
-	nop			; "
-	nop			; "
-	nop			; "
-	nop			; "
-	nop			; "
-	nop			; "
-	nop			; "
-	nop			; "
-	nop			; "
-	nop			; "
-	nop			; "
-	nop			; "
-	nop			; "
-	nop			; "
-	nop			; "
 	nop			; "
 	nop			; "
 	nop			; "
