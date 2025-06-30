@@ -1,6 +1,6 @@
 # TashSync
 
-Macintosh video sync signal converter/generator for PIC12F1501.
+Macintosh video sync signal converter/generator for PIC12F1501 and Apple IIgs video sync signal converter/generator for PIC10F320.
 
 
 ## Project Status
