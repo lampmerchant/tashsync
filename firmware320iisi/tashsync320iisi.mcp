@@ -1,7 +1,7 @@
 [HEADER]
 magic_cookie={66E99B07-E706-4689-9E80-9B2582898A13}
 file_version=1.0
-device=PIC12F1501
+device=PIC10F320
 [PATH_INFO]
 BuildDirPolicy=BuildDirIsProjectDir
 dir_src=
@@ -33,8 +33,8 @@ file_001=no
 file_000=no
 file_001=no
 [FILE_INFO]
-file_000=tashsync.asm
-file_001=C:\Program Files\Microchip\MPASM Suite\p12f1501.inc
+file_000=tashsync320iisi.asm
+file_001=C:\Program Files\Microchip\MPASM Suite\p10f320.inc
 [SUITE_INFO]
 suite_guid={6B3DAA78-59C1-46DD-B6AA-DBDAE4E06484}
 suite_state=generate-absolute-code
