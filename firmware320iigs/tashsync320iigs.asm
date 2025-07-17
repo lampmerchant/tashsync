@@ -34,14 +34,14 @@
 	#include	P10F320.inc
 	errorlevel	-302	;Suppress "register not in bank 0" messages
 	errorlevel	-224	;Suppress TRIS instruction not recommended msgs
-	__config	_FOSC_INTOSC & _BOREN_OFF & _WDTE_SWDTEN & _PWRTE_ON & _MCLRE_ON & _CP_OFF &_LVP_OFF & _LPBOR_OFF & _BORV_LO & _WRT_OFF
+	__config	_FOSC_INTOSC & _BOREN_OFF & _WDTE_SWDTEN & _PWRTE_ON & _MCLRE_ON & _CP_OFF &_LVP_ON & _LPBOR_OFF & _BORV_LO & _WRT_OFF
 			;_FOSC_INTOSC	Internal oscillator, I/O on RA1
 			;_BOREN_OFF	Brownout reset off
 			;_WDTE_SWDTEN	Watchdog timer CONTROLLED BY FIRMWARE
 			;_PWRTE_ON	Keep in reset for 64 ms on start
 			;_MCLRE_ON	RA3/!MCLR is !MCLR
 			;_CP_OFF	Code protection off
-			;_LVP_OFF	High-voltage on Vpp to program
+			;_LVP_ON	Low-voltage programming supported
 			;_LPBOR_OFF	Low power brownout reset disabled
 			;_BORV_LO	Brownout reset voltage low trip point
 			;_WRT_OFF	Write protection off
@@ -62,7 +62,6 @@ PCYCLES	equ	300000	;Number of cycles to spend assessing polarity
 VS_PIN	equ	RA0	;Vertical sync output pin
 HS_PIN	equ	RA1	;Horizontal sync output pin
 CS_PIN	equ	RA2	;Composite sync input pin
-SW_PIN	equ	RA3	;Switch pin
 
 ;FLAGS:
 NEGPULS	equ	7	;Set if horizontal pulses are negative
@@ -84,7 +83,7 @@ IHGOTO	equ	6	;Controls the destination of the interrupt handler
 	X7
 	X6
 	X5
-	X4	
+	X4
 	X3	;Various purposes
 	X2	; "
 	X1	; "

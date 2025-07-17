@@ -88,6 +88,7 @@ CS_PIN	equ	RA2	;Composite sync input pin
 
 ;FLAGS:
 PREPOST	equ	7	;State flag for vertical sync area
+SERRATE	equ	6	;Set if there are serrated pulses
 
 
 ;;; Variable Storage ;;;
@@ -226,12 +227,18 @@ Main5	XCALL	NextEdgeDelta	;Establish a time base from the next edge
 	btfss	STATUS,C	; a full pulse instead of a serration), skip
 	goto	Main6		; ahead
 	incf	SERCNT,F	;Count a serrated pulse
+	bsf	FLAGS,SERRATE	;Flag that there are serrated pulses
 	movlw	4		;Shorten the number of edges to skip by 4 (two
 	addwf	TSKIPL,F	; per serrated pulse, one serrated pulse per
 	btfsc	STATUS,C	; side)
 	incf	TSKIPH,F	; "
 	goto	Main5		;Loop to count more
-Main6	movf	TSKIPH,W	;Set up an up counter of horizontal pulses,
+Main6	btfsc	FLAGS,SERRATE	;If there are no serrated pulses, skip one fewer
+	goto	Main7		; pulse because we need something to time the
+	incf	TSKIPL,F	; PWM off of
+	btfsc	STATUS,Z	; "
+	incf	TSKIPH,F	; "
+Main7	movf	TSKIPH,W	;Set up an up counter of horizontal pulses,
 	movwf	X2		; skipping two fewer because we counted two
 	movf	TSKIPL,W	; extra in the course of looking for serrated
 	addlw	2		; pulses
@@ -252,33 +259,38 @@ Loop
 	goto	SignalChange	; but it's the best I think we can do
 	movf	SERCNT,W	;Load a down counter with the count of serrated
 	movwf	X1		; pulses
-	btfsc	STATUS,Z	;If it's zero, skip ahead to handle the vertical
-	goto	LoopX		; pulse all on its own
-	bcf	STATUS,C	;Double the down counter
+	btfss	STATUS,Z	;If there are no serrated pulses, skip ahead to
+	goto	Loop0		; time the PWM off of the one before the
+	incf	X1,F		; vertical pulse
+	goto	Loop2		; "
+Loop0	bcf	STATUS,C	;Else, double the down counter
 	rlf	X1,F		; "
-Loop0	btfsc	X1,0		;If the down counter is odd (we're about to hit
-	goto	Loop1		; a pulse we should swallow), skip ahead
-	decf	PR2,W		;Force PWM output to active (low)
+Loop1	btfsc	X1,0		;If the down counter is odd (we're about to hit
+	goto	Loop3		; a pulse we should swallow), skip ahead
+Loop2	decf	PR2,W		;Force PWM output to active (low)
 	movwf	TMR2		; "
 	movf	PR2,W		; "
 	addlw	-6		; "
 	movwf	TMR2		; "
 	IHCALL	ClearTimer2	;Repeatedly clear Timer2 until primary edge
-	goto	Loop2		;Skip ahead
-Loop1	clrf	INTCON		;This is a pulse we should swallow, so don't
+	btfss	FLAGS,SERRATE	;If there are no serrated pulses, skip ahead to
+	goto	Loop4		; switch the output to PWM1
+	goto	Loop5		;Skip ahead
+Loop3	clrf	INTCON		;This is a pulse we should swallow, so don't
 	btfss	INTCON,INTF	; time the PWM based on it, just wait for its
 	goto	$-1		; primary edge
 	decfsz	X1,W		;If this is the last edge before the vertical
-	goto	Loop2		; pulse, switch the output to be PWM1
-	movlw	B'00001000'	; "
+	goto	Loop5		; pulse, switch the output to be PWM1
+Loop4	movlw	B'00001000'	; "
 	movwf	CLC1GLS1	; "
-Loop2	btfss	PORTA,CS_PIN	;Whatever kind of pulse it is, wait until it's
+Loop5	btfss	PORTA,CS_PIN	;Whatever kind of pulse it is, wait until it's
 	goto	$-1		; passed
-Loop3	movlw	1 << LC1OE	;Toggle the output enable (stick horizontal sync
-	xorwf	CLC1CON,F	; high if it's off)
+Loop6	movlw	1 << LC1OE	;Toggle the output enable (stick horizontal sync
+	btfsc	FLAGS,SERRATE	; high if it's off), unless there are no
+	xorwf	CLC1CON,F	; serrated pulses
 	decfsz	X1,F		;Repeat for each edge
-	goto	Loop0		; "
-LoopX	clrf	INTCON		;We've reached the vertical pulse, almost; wait
+	goto	Loop1		; "
+	clrf	INTCON		;We've reached the vertical pulse, almost; wait
 	btfss	INTCON,INTF	; for it to begin
 	goto	$-1		; "
 	btfss	FLAGS,PREPOST	;If this is the first time we're going through
@@ -295,16 +307,16 @@ LoopX	clrf	INTCON		;We've reached the vertical pulse, almost; wait
 	movlw	B'00000010'	;Switch output back to reflecting composite sync
 	movwf	CLC1GLS1	; "
 	btfsc	FLAGS,PREPOST	;If this is the second time we've gone through
-	goto	Loop4		; this loop, skip ahead
+	goto	Loop7		; this loop, skip ahead
 	movf	SERCNT,W	;If not, load the counter for the post-vertical
 	movwf	X1		; serrated pulses
 	btfsc	STATUS,Z	;If there are none, skip ahead
-	goto	Loop4		; "
+	goto	Loop7		; "
 	bcf	STATUS,C	;Double the counter as before
 	rlf	X1,F		; "
 	bsf	FLAGS,PREPOST	;Flag that this is our second trip through the
-	goto	Loop3		; loop and loop
-Loop4	bcf	FLAGS,PREPOST	;Clear the flag for next time
+	goto	Loop6		; loop and loop
+Loop7	bcf	FLAGS,PREPOST	;Clear the flag for next time
 	movf	TSKIPH,W	;Set up the up counter for skipping through the
 	movwf	X2		; horizontal edges
 	movf	TSKIPL,W	; "
@@ -367,22 +379,11 @@ PollTimer0
 	movf	TMR0,W		; "
 	movf	TMR0,W		; "
 	movf	TMR0,W		; "
-	movf	TMR0,W		; "
-	movf	TMR0,W		; "
-	movf	TMR0,W		; "
-	movf	TMR0,W		; "
-	movf	TMR0,W		; "
 	goto	PollTimer0	;Loop
 
 ClearTimer2
 	movlw	1		;Continually clear Timer2 until an interrupt
 ClrTm20	movwf	TMR2		; breaks us out of the loop
-	movwf	TMR2		; "
-	movwf	TMR2		; "
-	movwf	TMR2		; "
-	movwf	TMR2		; "
-	movwf	TMR2		; "
-	movwf	TMR2		; "
 	movwf	TMR2		; "
 	movwf	TMR2		; "
 	movwf	TMR2		; "
